@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    hostname: redis
+    ports:
+      - "6392:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - broker_extractor_network
+
+  fastapi_app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - ./uploaded_pdfs:/app/uploaded_pdfs
+      - ./cache/.paddlex/:/root/.paddlex/
+      - ./:/app/
+    ports:
+      - "8022:8000"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - NVIDIA_VISIBLE_DEVICES=6
+    runtime: nvidia
+    depends_on:
+      - redis
+    networks:
+      - broker_extractor_network
+
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A app.tasks.celery_app worker --loglevel=info --pool=solo
+    volumes:
+      - ./uploaded_pdfs:/app/uploaded_pdfs
+      - ./cache/.paddlex/:/root/.paddlex/
+      - ./outputs:/app/outputs
+      - ./:/app/
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - NVIDIA_VISIBLE_DEVICES=6
+    depends_on:
+      - redis
+      - fastapi_app
+    runtime: nvidia   
+    networks:
+      - broker_extractor_network
+
+volumes:
+  redis_data:
+
+networks:
+  broker_extractor_network:
+    driver: bridge
+
