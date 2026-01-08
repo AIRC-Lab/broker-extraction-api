@@ -87,4 +87,3 @@ class PDFProcessor:
         return extracted_data
 
 pdf_processor = PDFProcessor()
-

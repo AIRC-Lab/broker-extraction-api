@@ -135,4 +135,3 @@ async def download_all_excel(task_id: str):
         filename=f"{task_id}_excel_files.zip",
         background=lambda: os.unlink(zip_path) if os.path.exists(zip_path) else None
     )
-

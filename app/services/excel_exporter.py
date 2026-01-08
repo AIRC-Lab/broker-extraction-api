@@ -28,4 +28,3 @@ class ExcelExporter:
         return output_path
 
 excel_exporter = ExcelExporter()
-

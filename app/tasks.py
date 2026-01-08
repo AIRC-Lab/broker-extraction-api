@@ -70,4 +70,3 @@ def process_pdf_task(self, pdf_path: str):
         self.update_state(state='FAILURE', meta={'current_step': 'Error during processing', 'error': str(e)})
         return {"status": "failure", "message": "Error during processing"}
         # raise  # Re-raise the exception so Celery can handle it properly
-

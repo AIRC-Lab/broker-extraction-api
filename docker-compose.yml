@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7-alpine
@@ -25,7 +23,7 @@ services:
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
-      - NVIDIA_VISIBLE_DEVICES=6
+      - NVIDIA_VISIBLE_DEVICES=0
     runtime: nvidia
     depends_on:
       - redis
@@ -45,7 +43,7 @@ services:
     environment:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
-      - NVIDIA_VISIBLE_DEVICES=6
+      - NVIDIA_VISIBLE_DEVICES=0
     depends_on:
       - redis
       - fastapi_app
