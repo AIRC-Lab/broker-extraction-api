@@ -6,23 +6,29 @@ from pypdf import PdfReader
 from paddleocr import PaddleOCR
 from ultralytics import YOLO
 from pdf2image import convert_from_path
+import numpy as np
+
 from app.utils import classify_page_type
 from .position_processor import PositionProcessor
 from .transaction_processor import TransactionProcessor
-import numpy as np
+
+
 class PDFProcessor:
     def __init__(self):
         # Initialize PaddleOCR once to avoid repeated loading
-        # lang='en' for English, use_gpu=False for CPU only
-        # For production, consider setting use_gpu=True if a GPU is available
+        # IMPORTANT: enable GPU
         self.ocr = PaddleOCR(
             text_detection_model_name="PP-OCRv5_server_det",
             text_recognition_model_name="PP-OCRv5_server_rec",
-            use_doc_orientation_classify=False, # Disables document orientation classification model via this parameter
-            use_doc_unwarping=False, # Disables text image rectification model via this parameter
-            use_textline_orientation=False, # Disables text line orientation classification model via this parameter
+            use_gpu=True,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
         )
+
+        # YOLO will use GPU automatically if available
         self.yolo = YOLO("app/weights/yolo_broker_line_detect.pt")
+
         self.postion_processor = PositionProcessor()
         self.transaction_processor = TransactionProcessor()
 
@@ -36,54 +42,64 @@ class PDFProcessor:
             print(f"[DEBUG] Converted {len(images)} pages from PDF to images.")
             return images
         except Exception as e:
-            print(f"Error converting PDF to images: {e}")
+            print(f"[ERROR] Error converting PDF to images: {e}")
             raise
 
-    def classify_page(self, image: Image.Image) -> str:
+    def classify_page(self, ocr_result: list) -> str:
         """
-        Classifies a page as 'position' or 'transaction' based on its content.
-        This is a placeholder and would involve more sophisticated logic (e.g., keyword spotting, layout analysis).
-        For demonstration, it will perform OCR on the image and look for keywords.
+        Classifies a page as 'position' or 'transaction' based on OCR text.
+        OCR is NOT called here (to avoid running OCR twice).
         """
-        # Perform OCR on the image to get text for classification
-        ocr_result = self.perform_ocr(image)
-        full_text = " ".join(ocr_result[0]["rec_texts"])
-        page_type = classify_page_type(full_text)
-        print(f"[DEBUG] Classified page as: {page_type}")
-        return page_type
+        try:
+            if not ocr_result or not ocr_result[0] or "rec_texts" not in ocr_result[0]:
+                return "other"
+            full_text = " ".join(ocr_result[0]["rec_texts"])
+            page_type = classify_page_type(full_text)
+            print(f"[DEBUG] Classified page as: {page_type}")
+            return page_type
+        except Exception as e:
+            print(f"[WARN] classify_page failed: {e}")
+            return "other"
 
     def perform_ocr(self, image: Image.Image) -> list:
         """
-        Performs OCR on an image using PaddleOCR and returns the raw OCR result.
+        Performs OCR on an image using PaddleOCR and returns the OCR result
+        in the format expected by processors:
+          ocr_result = [{
+              "rec_boxes": [...],
+              "rec_texts": [...],
+              "rec_scores": [...]
+          }]
         """
-        # Convert PIL Image to numpy array for PaddleOCR
         img_array = np.array(image)
-        ocr_result = self.ocr.ocr(img_array)
-        ocr_box = ocr_result[0]["rec_boxes"]
-        ocr_text = ocr_result[0]["rec_texts"]
-        if "Description" in ocr_text:
-            des_idx = ocr_text.index("Description")
-            amount_sep = ocr_box[des_idx]
-            cv2.rectangle(img_array, (amount_sep[0]-2, 0), (amount_sep[0]-1, img_array.shape[1]), color=(255, 0, 0), thickness=1)
+        try:
             result = self.ocr.ocr(img_array)
-        else:
-            result = ocr_result
-        print(f"[DEBUG] Performed OCR. Found {len(result[0]) if result and result[0] else 0} text blocks.")
-        return result
+            # Some PaddleOCR versions may return already in dict format;
+            # we assume your current pipeline returns list[dict].
+            # Keep as-is.
+            print(f"[DEBUG] Performed OCR. Found {len(result[0]) if result and result[0] else 0} text blocks.")
+            return result
+        except Exception as e:
+            print(f"[ERROR] OCR failed: {e}")
+            raise
 
-    def extract_info(self, image: Image.Image, ocr_result: list, page_type: str) -> dict:
+    def extract_info(self, image: Image.Image, ocr_result: list, page_type: str):
         """
-        Extracts structured information from the OCR result based on page type.
-        This is a placeholder for complex parsing logic.
-        """        
-        # Example: Simple extraction based on page type and OCR results
-        if page_type == 'position':
-            extracted_data = self.postion_processor.process(self.yolo, image, ocr_result)
-        elif page_type == 'transaction':
-            extracted_data = self.transaction_processor.process(self.yolo, image, ocr_result)
-        else:
-            extracted_data = {}
-        print(f"[DEBUG] Extracted info for {page_type} page.")
-        return extracted_data
+        Extract structured information from the OCR result based on page type.
+        Uses improved PositionProcessor / TransactionProcessor logic.
+        """
+        try:
+            if page_type == 'position':
+                extracted_data = self.postion_processor.process(self.yolo, image, ocr_result)
+            elif page_type == 'transaction':
+                extracted_data = self.transaction_processor.process(self.yolo, image, ocr_result)
+            else:
+                extracted_data = {}
+            print(f"[DEBUG] Extracted info for {page_type} page.")
+            return extracted_data
+        except Exception as e:
+            print(f"[WARN] extract_info failed for page_type={page_type}: {e}")
+            return {}
+
 
 pdf_processor = PDFProcessor()

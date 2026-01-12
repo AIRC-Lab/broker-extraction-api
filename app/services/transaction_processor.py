@@ -155,7 +155,6 @@ class TransactionProcessor:
                     row_excel["Quantity"] = ""
                     row_excel["Foreign Unit Price/ Interest rate"] = ""
 
-                    # ✅ FIX ONLY HERE: keep negative sign for OTHER
                     foreign_gross_consideration, foreign_net_consideration, accrued_interest = \
                         get_foreign_gross_net_consideration_other(row_json)
 
@@ -175,7 +174,6 @@ class TransactionProcessor:
                 elif transaction_type == "FX Forward":
                     trade_date, settlement_date = get_trade_settlement_date(row_json)
 
-                    # ✅ FIX: skip row that is NOT truly FX Forward (row from other section)
                     rate = get_fx_forward_rate(row_json)
                     if rate == "":
                         continue
@@ -199,7 +197,8 @@ class TransactionProcessor:
 
                     fx_tf_information.append(row_excel)
 
-            except Exception:
+            except Exception as e:
+                print(f"[WARN] Transaction row skipped due to error: {e}")
                 continue
 
         return {

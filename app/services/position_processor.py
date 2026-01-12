@@ -1,10 +1,9 @@
 from typing import List, Any
-
 from PIL import Image
 from app.utils import *
-
 import math
 import numpy as np
+import re
 
 
 class PositionProcessor:
@@ -136,31 +135,18 @@ class PositionProcessor:
                     currency = get_currency_position(row_json)
                     isin = get_isin_position(row_json)
 
-                    # existing quantity logic
                     amount = get_position_amount(row_json, self.position_type)
 
-                    # -------------------------------------------------------
-                    # FIX: Security name must NOT contain leading quantity
-                    # Example bad: "100 000 Toyota Motor Credit Corp ..."
-                    # Keep pdf-like name, remove only true leading quantity.
-                    # -------------------------------------------------------
                     security_name_raw = get_security_name(row_json, self.position_type)
 
                     extracted_qty, cleaned_name = split_leading_quantity_general(security_name_raw)
                     if extracted_qty is not None:
-                        # IMPORTANT: we only use this to CLEAN NAME,
-                        # we do NOT overwrite Quantity/ Amount here.
                         security_name = cleaned_name
                     else:
                         security_name = security_name_raw
 
                     security_name = re.sub(r"\s+", " ", (security_name or "")).strip()
 
-                    # =========================================================
-                    # ✅ FIX ONLY: Fill missing Quantity/Amount from Security line
-                    # Keep name logic unchanged, only fill 'amount' when missing.
-                    # Use position-specific splitter (handles OCR "o/O" -> 0 etc.)
-                    # =========================================================
                     try:
                         if amount == "" or amount is None:
                             extracted_qty_pos, _cleaned_name_pos = split_leading_quantity_position(security_name_raw)
@@ -188,7 +174,8 @@ class PositionProcessor:
 
                     extracted_position_data.append(row_excel)
 
-            except Exception:
+            except Exception as e:
+                print(f"[WARN] Position row skipped due to error: {e}")
                 continue
 
         return extracted_position_data

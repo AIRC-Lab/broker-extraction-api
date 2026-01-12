@@ -59,7 +59,6 @@ def classify_page_type(text: str) -> str:
 
     Returns:
         - "position"
-        - "liquidity - accounts"
         - "transaction"
         - "other"
     """
@@ -360,39 +359,23 @@ def get_foreign_gross_net_consideration(row_json, transaction_type):
 
 
 # =========================
-# ✅ FX Forward helpers (ONLY for fx_tf)
+# ✅ FX Forward helpers (robust)
 # =========================
 def _parse_signed_number_string(num_str: str):
-    """
-    Parse a numeric string that may contain spaces/commas and optional sign.
-    Keep the sign if present.
-    Examples:
-      "408 156.10" -> 408156.10
-      "-437 212.32" -> -437212.32
-      "(437 212.32)" -> -437212.32
-      "289792000" -> 289792000
-    """
     if not num_str:
         return ""
     s = str(num_str).strip()
-
-    # normalize weird minus chars if OCR returns them
     s = s.replace("−", "-").replace("–", "-")
 
-    # parentheses as negative (accounting style)
     neg_by_paren = False
     if "(" in s and ")" in s:
         neg_by_paren = True
 
-    # keep only sign, digits, dot, comma, space, parentheses
     s_clean = re.sub(r"[^0-9\-\+\s,\.()]", "", s).strip()
     if not s_clean:
         return ""
 
-    # remove parentheses for parsing
     s_clean = s_clean.replace("(", "").replace(")", "")
-
-    # remove thousand separators (space/comma)
     s_clean = s_clean.replace(" ", "").replace(",", "")
 
     try:
@@ -405,19 +388,12 @@ def _parse_signed_number_string(num_str: str):
 
 
 def _compact_lower(s: str) -> str:
-    """lower + remove all whitespace for OCR-tolerant matching"""
     if not s:
         return ""
     return re.sub(r"\s+", "", s.lower()).strip()
 
 
 def _extract_ccy_amount_pairs(lines: List[str]):
-    """
-    Fallback: scan all lines and collect currency-amount pairs like:
-      EUR 408156.1
-      USD -437212.32
-    Return list of tuples (CCY, amount_float)
-    """
     pairs = []
     if not lines:
         return pairs
@@ -429,7 +405,6 @@ def _extract_ccy_amount_pairs(lines: List[str]):
         if not t:
             continue
 
-        # find ALL occurrences in the same line (sometimes both appear)
         for m in re.finditer(r"\b([A-Z]{3})\s+([+\-]?\d[\d\s,\.()\-]*)", t):
             ccy = (m.group(1) or "").strip()
             amt_raw = (m.group(2) or "").strip()
@@ -437,7 +412,6 @@ def _extract_ccy_amount_pairs(lines: List[str]):
             if ccy and isinstance(amt, (int, float)):
                 pairs.append((ccy, amt))
 
-    # dedupe while keeping order
     seen = set()
     out = []
     for ccy, amt in pairs:
@@ -450,18 +424,11 @@ def _extract_ccy_amount_pairs(lines: List[str]):
 
 
 def _extract_fx_amount_line(lines: List[str], verb: str):
-    """
-    Extract (currency, amount) from a line like:
-      "You bought EUR 408 156.10"
-      "You sold  USD -437 212.32"
-    verb: "bought" or "sold"
-    """
     if not lines:
         return "", ""
 
-    verb_key = f"you{verb}"  # compact key: "youbought" / "yousold"
+    verb_key = f"you{verb}"
 
-    # 1) try find explicit verb line (OCR tolerant)
     for ln in lines:
         if not ln:
             continue
@@ -489,13 +456,11 @@ def _extract_fx_amount_line(lines: List[str], verb: str):
             amt = _parse_signed_number_string((m.group(2) or "").strip())
 
         if verb == "sold" and isinstance(amt, (int, float)):
-            # enforce negative if OCR lost sign
             if amt > 0:
                 amt = -amt
 
         return cur, amt
 
-    # 2) fallback: scan currency/amount pairs from all lines
     pairs = _extract_ccy_amount_pairs(lines)
     if len(pairs) >= 2:
         buy_ccy, buy_amt = pairs[0]
@@ -522,9 +487,6 @@ def get_currency_amount_sell(row_json):
 
 
 def get_fx_forward_rate(row_json):
-    """
-    robust Rate fallback for FX Forward.
-    """
     candidates = []
     candidates.extend(row_json.get("Cost/Purchase price", []))
     candidates.extend(row_json.get("Transaction price", []))
@@ -560,7 +522,7 @@ def get_account_no_buy_sell(row_json):
     account_buy = "-".join(account_buy.split("-")[1:])
     account_sell = "-".join(account_sell.split("-")[1:])
 
-    # ✅ FIX: OCR hay nhầm '.' thành ',' trong account number
+    # OCR often confuses '.' with ','
     account_buy = account_buy.replace(",", ".")
     account_sell = account_sell.replace(",", ".")
 
@@ -578,10 +540,6 @@ def is_account_no_like(s: str) -> bool:
 
 
 def split_leading_quantity_general(text: str):
-    """
-    Split leading quantity from a security line like:
-      '100 000 4.625% Medium Term Notes Toyota Motor Credit Corp.'
-    """
     if not text or not isinstance(text, str):
         return None, text
 
@@ -617,10 +575,6 @@ def split_leading_quantity_general(text: str):
 
 
 def split_leading_quantity_position(text: str):
-    """
-    Handle position Security name like:
-      '2 000 Shs Air Liquide SA (AI)'
-    """
     if not text or not isinstance(text, str):
         return None, text
 
@@ -768,22 +722,12 @@ def _is_negative_hint_text(s: str) -> bool:
 
 
 def get_foreign_gross_net_consideration_other(row_json):
-    """
-    For OTHER (UBS Call Deposit): preserve sign for amounts.
-    - Prefer reading from 'Transaction value' last cell (same as old logic)
-    - Parse signed float, keep '-' or parentheses if present
-    - If OCR lost '-', use booking_text heuristic:
-        Reduction / Repayment  -> negative
-        Interest Cap.         -> positive
-    Return: (gross, net, accrued_interest)
-    """
     booking_text = " ".join(row_json.get("Booking text", [])).strip()
     booking_text = booking_text.replace("\n", " ").strip()
     bt_low = booking_text.lower()
 
     txv = row_json.get("Transaction value", [])
 
-    # choose values similarly to old logic (but we keep sign)
     if booking_text == "Sale Spot" and len(txv) >= 3:
         gross_raw = txv[0]
         net_raw = txv[-1]
@@ -796,12 +740,9 @@ def get_foreign_gross_net_consideration_other(row_json):
     gross_val = _parse_signed_number_string(gross_raw)
     net_val = _parse_signed_number_string(net_raw)
 
-    # heuristic sign fix ONLY for other:
-    # reduction/repayment typically outflow -> negative
     should_be_negative = ("reduction" in bt_low) or ("repayment" in bt_low)
     should_be_positive = ("interest cap" in bt_low) or ("interest" in bt_low)
 
-    # If OCR lost sign (we detect no sign hint) and value is positive, apply heuristic
     if isinstance(gross_val, (int, float)) and gross_val > 0:
         if should_be_negative and (not _is_negative_hint_text(gross_raw)):
             gross_val = -gross_val
@@ -809,13 +750,11 @@ def get_foreign_gross_net_consideration_other(row_json):
         if should_be_negative and (not _is_negative_hint_text(net_raw)):
             net_val = -net_val
 
-    # if heuristic says positive, ensure positive
     if isinstance(gross_val, (int, float)) and gross_val < 0 and should_be_positive and (not should_be_negative):
         gross_val = abs(gross_val)
     if isinstance(net_val, (int, float)) and net_val < 0 and should_be_positive and (not should_be_negative):
         net_val = abs(net_val)
 
-    # normalize empty
     if gross_val == "":
         gross_val = 0.0
     if net_val == "":

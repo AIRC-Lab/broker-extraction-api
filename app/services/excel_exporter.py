@@ -1,30 +1,40 @@
 import pandas as pd
 import os
 
+
 class ExcelExporter:
-    def export_to_excel(self, data: list[dict], output_path: str) -> str:
+    def export_to_excel(self, data: dict, output_path: str) -> str:
         """
-        Exports a list of dictionaries (extracted data) to an Excel file.
-        Each dictionary represents data from a page or a set of extracted fields.
+        Exports extracted data to 4 Excel files:
+          - postion.xlsx
+          - trade.xlsx
+          - fx_tf.xlsx
+          - other.xlsx
+
+        Folder: outputs/<task_id>/
         """
-        if not data:
+        if data is None:
             raise ValueError("No data provided for Excel export.")
-        postion_data = data["position"]
-        df = pd.DataFrame(postion_data)
 
         if not os.path.exists(output_path):
-            os.makedirs(output_path)
+            os.makedirs(output_path, exist_ok=True)
 
-        df.to_excel(os.path.join(output_path,f"postion.xlsx"), index=False)
-        print(f"[DEBUG] Data exported to Excel: {output_path}")
-        transaction_data = data["transaction"]
-        for d_type in transaction_data:
-            df = pd.DataFrame(transaction_data[d_type])
-            if not os.path.exists(output_path):
-                os.makedirs(output_path)
+        # 1) POSITION
+        postion_data = data.get("position", []) or []
+        df_pos = pd.DataFrame(postion_data)
+        df_pos.to_excel(os.path.join(output_path, "postion.xlsx"), index=False)
+        print(f"[DEBUG] Exported: {os.path.join(output_path, 'postion.xlsx')}")
 
+        # 2) TRANSACTIONS (always export 3 files)
+        transaction_data = data.get("transaction", {}) or {}
+
+        for d_type in ["trade", "fx_tf", "other"]:
+            rows = transaction_data.get(d_type, []) or []
+            df = pd.DataFrame(rows)
             df.to_excel(os.path.join(output_path, f"{d_type}.xlsx"), index=False)
-            print(f"[DEBUG] Data exported to Excel: {output_path}")
+            print(f"[DEBUG] Exported: {os.path.join(output_path, f'{d_type}.xlsx')}")
+
         return output_path
+
 
 excel_exporter = ExcelExporter()
