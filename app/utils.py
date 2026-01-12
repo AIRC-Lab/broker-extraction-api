@@ -359,47 +359,196 @@ def get_foreign_gross_net_consideration(row_json, transaction_type):
     return foreign_gross_consideration, foreign_net_consideration, accrued_interest
 
 
-def get_currency_amount_buy(row_json):
-    text = "\n".join(row_json.get("Custody account", []))
-    lines = text.strip().split("\n")
+# =========================
+# ✅ FX Forward helpers (ONLY for fx_tf)
+# =========================
+def _parse_signed_number_string(num_str: str):
+    """
+    Parse a numeric string that may contain spaces/commas and optional sign.
+    Keep the sign if present.
+    Examples:
+      "408 156.10" -> 408156.10
+      "-437 212.32" -> -437212.32
+      "(437 212.32)" -> -437212.32
+      "289792000" -> 289792000
+    """
+    if not num_str:
+        return ""
+    s = str(num_str).strip()
 
-    if len(lines) >= 1 and "bought" in lines[0].lower():
-        description_buy = lines[0]
-    elif len(lines) >= 2 and "bought" in lines[1].lower():
-        description_buy = lines[1]
-    else:
+    # normalize weird minus chars if OCR returns them
+    s = s.replace("−", "-").replace("–", "-")
+
+    # parentheses as negative (accounting style)
+    neg_by_paren = False
+    if "(" in s and ")" in s:
+        neg_by_paren = True
+
+    # keep only sign, digits, dot, comma, space, parentheses
+    s_clean = re.sub(r"[^0-9\-\+\s,\.()]", "", s).strip()
+    if not s_clean:
+        return ""
+
+    # remove parentheses for parsing
+    s_clean = s_clean.replace("(", "").replace(")", "")
+
+    # remove thousand separators (space/comma)
+    s_clean = s_clean.replace(" ", "").replace(",", "")
+
+    try:
+        val = float(s_clean)
+        if neg_by_paren and val > 0:
+            val = -val
+        return val
+    except:
+        return ""
+
+
+def _compact_lower(s: str) -> str:
+    """lower + remove all whitespace for OCR-tolerant matching"""
+    if not s:
+        return ""
+    return re.sub(r"\s+", "", s.lower()).strip()
+
+
+def _extract_ccy_amount_pairs(lines: List[str]):
+    """
+    Fallback: scan all lines and collect currency-amount pairs like:
+      EUR 408156.1
+      USD -437212.32
+    Return list of tuples (CCY, amount_float)
+    """
+    pairs = []
+    if not lines:
+        return pairs
+
+    for ln in lines:
+        if not ln:
+            continue
+        t = re.sub(r"\s+", " ", str(ln)).strip()
+        if not t:
+            continue
+
+        # find ALL occurrences in the same line (sometimes both appear)
+        for m in re.finditer(r"\b([A-Z]{3})\s+([+\-]?\d[\d\s,\.()\-]*)", t):
+            ccy = (m.group(1) or "").strip()
+            amt_raw = (m.group(2) or "").strip()
+            amt = _parse_signed_number_string(amt_raw)
+            if ccy and isinstance(amt, (int, float)):
+                pairs.append((ccy, amt))
+
+    # dedupe while keeping order
+    seen = set()
+    out = []
+    for ccy, amt in pairs:
+        key = (ccy, amt)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((ccy, amt))
+    return out
+
+
+def _extract_fx_amount_line(lines: List[str], verb: str):
+    """
+    Extract (currency, amount) from a line like:
+      "You bought EUR 408 156.10"
+      "You sold  USD -437 212.32"
+    verb: "bought" or "sold"
+    """
+    if not lines:
         return "", ""
 
-    description_buy = re.sub("You bought", "", description_buy, flags=re.IGNORECASE).strip()
-    currency_buy = description_buy.split(" ")[0].strip()
-    amount_buy = "".join(description_buy.split(" ")[1:]).strip()
-    amount_buy = re.sub(r"\s+", "", amount_buy).strip()
-    amount_buy = abs(float(amount_buy)) if amount_buy else 0.0
-    return currency_buy, amount_buy
+    verb_key = f"you{verb}"  # compact key: "youbought" / "yousold"
+
+    # 1) try find explicit verb line (OCR tolerant)
+    for ln in lines:
+        if not ln:
+            continue
+        t = re.sub(r"\s+", " ", str(ln)).strip()
+        if not t:
+            continue
+
+        low_compact = _compact_lower(t)
+        if verb_key not in low_compact:
+            continue
+
+        m = re.search(
+            rf"\byou\s*{''.join([ch + r'\s*' for ch in verb])}\s*([A-Z]{{3}})\s*([+\-]?\d[\d\s,\.()\-]*)",
+            t,
+            flags=re.IGNORECASE
+        )
+        if not m:
+            mm = re.search(r"\b([A-Z]{3})\s+([+\-]?\d[\d\s,\.()\-]*)", t)
+            if not mm:
+                continue
+            cur = (mm.group(1) or "").strip()
+            amt = _parse_signed_number_string((mm.group(2) or "").strip())
+        else:
+            cur = (m.group(1) or "").strip()
+            amt = _parse_signed_number_string((m.group(2) or "").strip())
+
+        if verb == "sold" and isinstance(amt, (int, float)):
+            # enforce negative if OCR lost sign
+            if amt > 0:
+                amt = -amt
+
+        return cur, amt
+
+    # 2) fallback: scan currency/amount pairs from all lines
+    pairs = _extract_ccy_amount_pairs(lines)
+    if len(pairs) >= 2:
+        buy_ccy, buy_amt = pairs[0]
+        sell_ccy, sell_amt = pairs[1]
+
+        if verb == "bought":
+            return buy_ccy, buy_amt
+        else:
+            if isinstance(sell_amt, (int, float)) and sell_amt > 0:
+                sell_amt = -sell_amt
+            return sell_ccy, sell_amt
+
+    return "", ""
+
+
+def get_currency_amount_buy(row_json):
+    lines = row_json.get("Custody account", [])
+    return _extract_fx_amount_line(lines, verb="bought")
 
 
 def get_currency_amount_sell(row_json):
-    text = "\n".join(row_json.get("Custody account", []))
-    lines = text.strip().split("\n")
+    lines = row_json.get("Custody account", [])
+    return _extract_fx_amount_line(lines, verb="sold")
 
-    if len(lines) >= 1 and "sold" in lines[0].lower():
-        description_sell = lines[0]
-    elif len(lines) >= 2 and "sold" in lines[1].lower():
-        description_sell = lines[1]
-    else:
-        return "", ""
 
-    description_sell = re.sub("You sold", "", description_sell, flags=re.IGNORECASE).strip()
-    currency_sell = description_sell.split(" ")[0].strip()
-    amount_sell = "".join(description_sell.split(" ")[1:]).strip()
-    amount_sell = re.sub(r"\s+", "", amount_sell).strip()
+def get_fx_forward_rate(row_json):
+    """
+    robust Rate fallback for FX Forward.
+    """
+    candidates = []
+    candidates.extend(row_json.get("Cost/Purchase price", []))
+    candidates.extend(row_json.get("Transaction price", []))
+    candidates.extend(row_json.get("Transaction value", []))
+    candidates.extend(row_json.get("Booking text", []))
 
-    if len(amount_sell) == 0:
-        amount_sell = ""
-    else:
-        amount_sell = abs(float(amount_sell))
+    for c in candidates:
+        if not c:
+            continue
+        t = re.sub(r"\s+", " ", str(c)).strip()
+        if not t:
+            continue
 
-    return currency_sell, amount_sell
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", t)
+        if not m:
+            continue
+
+        rate_str = m.group(1)
+        try:
+            return float(rate_str)
+        except:
+            continue
+
+    return ""
 
 
 def get_account_no_buy_sell(row_json):
@@ -410,6 +559,11 @@ def get_account_no_buy_sell(row_json):
     account_buy, account_sell = lines[-2], lines[-1]
     account_buy = "-".join(account_buy.split("-")[1:])
     account_sell = "-".join(account_sell.split("-")[1:])
+
+    # ✅ FIX: OCR hay nhầm '.' thành ',' trong account number
+    account_buy = account_buy.replace(",", ".")
+    account_sell = account_sell.replace(",", ".")
+
     return account_buy, account_sell
 
 
@@ -427,12 +581,6 @@ def split_leading_quantity_general(text: str):
     """
     Split leading quantity from a security line like:
       '100 000 4.625% Medium Term Notes Toyota Motor Credit Corp.'
-
-    Guard rules:
-    - Only split when it looks like a real quantity:
-        * contains space/comma as thousands separator
-        OR long integer >= 5 digits (no decimal)
-    - Do NOT split if it's a rate line like '3.15% Notes...'
     """
     if not text or not isinstance(text, str):
         return None, text
@@ -448,7 +596,6 @@ def split_leading_quantity_general(text: str):
     qty_raw = (m.group(1) or "").strip()
     rest = (m.group(2) or "").strip()
 
-    # rate guard: "3.15% Notes"
     if rest.startswith("%"):
         return None, s
 
@@ -469,18 +616,10 @@ def split_leading_quantity_general(text: str):
     return qty, rest
 
 
-# ===== NEW: split leading quantity for POSITION rows (shares / nominal) =====
 def split_leading_quantity_position(text: str):
     """
     Handle position Security name like:
       '2 000 Shs Air Liquide SA (AI)'
-      '3 600 Reg.shs Compass Group Plc (CPG)'
-      '100 000 4.625% Medium Term Notes ...'
-      '9 0oo Reg.shs Advantest Corp.'  (OCR: o -> 0)
-
-    Rule:
-    - Split only when it starts with integer quantity (with spaces/commas or OCR o/O).
-    - Do NOT split if it starts with coupon rate like '3.703% Notes ...'
     """
     if not text or not isinstance(text, str):
         return None, text
@@ -489,14 +628,12 @@ def split_leading_quantity_position(text: str):
     if not s:
         return None, s
 
-    # Guard: coupon rate at start like 3.703% / 4.625%
     if re.match(r"^\d+(\.\d+)?\s*%", s):
         return None, s
 
     if not s[0].isdigit():
         return None, s
 
-    # capture quantity-ish prefix: digits, spaces, commas, dots, and OCR o/O
     m = re.match(r"^([0-9][0-9\s,\.oO]*)\s+(.*)$", s)
     if not m:
         return None, s
@@ -504,11 +641,9 @@ def split_leading_quantity_position(text: str):
     qty_raw = (m.group(1) or "").strip()
     rest = (m.group(2) or "").strip()
 
-    # normalize OCR o/O -> 0 for numeric part
     qty_raw_norm = qty_raw.replace("O", "0").replace("o", "0")
     qty_digits = re.sub(r"[^\d]", "", qty_raw_norm)
 
-    # must have at least 3 digits OR contain space/comma (like "2 000")
     has_sep = (" " in qty_raw_norm) or ("," in qty_raw_norm)
     if not (has_sep or len(qty_digits) >= 3):
         return None, s
@@ -521,49 +656,176 @@ def split_leading_quantity_position(text: str):
     except:
         return None, s
 
-    # rest cleanup
     rest = re.sub(r"\s+", " ", rest).strip()
     return qty, rest
 
 
+# -----------------------------
+# robust filters for TRADE "Name/ Security"
+# -----------------------------
+def _looks_like_noise_line_for_security_name(line: str) -> bool:
+    if not line:
+        return True
+
+    s = re.sub(r"\s+", " ", line).strip()
+    low = s.lower()
+
+    if low.startswith("you bought") or low.startswith("you sold"):
+        return True
+
+    if "isin" in low:
+        return True
+
+    if is_account_no_like(s):
+        return True
+
+    noise_keywords = [
+        "settlement", "settle", "reference", "ref.", "ref:",
+        "place of execution", "execution", "broker", "counterparty",
+        "custody", "account", "our ref", "your ref",
+        "fees", "commission", "tax", "withholding",
+        "swift", "instruction", "depository", "clearstream", "euroclear",
+        "value date", "valuedate", "payment", "against payment", "free of payment",
+        "trade no", "trade number", "deal no", "deal number",
+        "order", "order no", "order number",
+        "settlement no", "settlement number", "settlement n", "settlement#", "settlement #",
+        "contract", "contract no", "contract number",
+        "confirmation", "confirm",
+        "location", "market", "venue",
+    ]
+    for kw in noise_keywords:
+        if kw in low:
+            return True
+
+    if re.fullmatch(r"[A-Z0-9\-/]{6,}", s) and (" " not in s):
+        return True
+
+    return False
+
+
+def _is_strong_stop_line(line: str) -> bool:
+    if not line:
+        return False
+    s = re.sub(r"\s+", " ", line).strip()
+    low = s.lower()
+
+    if is_account_no_like(s):
+        return True
+
+    stop_keywords = [
+        "settlement", "place of execution", "broker", "counterparty",
+        "reference", "ref.", "ref:", "our ref", "your ref",
+        "trade no", "deal no", "order no", "contract",
+        "confirmation", "swift", "instruction",
+    ]
+    for kw in stop_keywords:
+        if kw in low:
+            return True
+
+    return False
+
+
 def build_security_name_from_custody_account_lines(lines: List[str]) -> str:
-    """
-    Build a clean security name from 'Custody account' OCR lines:
-    - drop lines that start with 'You bought' / 'You sold'
-    - drop lines containing 'ISIN'
-    - drop account-number-like lines
-    """
     if not lines:
         return ""
 
-    cleaned = []
+    cleaned_name_lines: List[str] = []
     for ln in lines:
         if not ln:
             continue
-        t = ln.strip()
+        t = re.sub(r"\s+", " ", ln).strip()
         if not t:
             continue
 
-        low = t.lower()
+        if _is_strong_stop_line(t):
+            break
 
-        if low.startswith("you bought") or low.startswith("you sold"):
+        if _looks_like_noise_line_for_security_name(t):
             continue
 
-        if "isin" in low:
-            continue
+        cleaned_name_lines.append(t)
 
-        if is_account_no_like(t):
-            continue
+        if len(cleaned_name_lines) >= 2:
+            break
 
-        cleaned.append(t)
-
-    name = " ".join(cleaned).strip()
+    name = " ".join(cleaned_name_lines).strip()
     name = re.sub(r"\s+", " ", name).strip()
     return name
 
 
+# ==========================================================
+# ✅ NEW: ONLY for OTHER (UBS Call Deposit) - keep minus sign
+# ==========================================================
+def _is_negative_hint_text(s: str) -> bool:
+    if not s:
+        return False
+    t = str(s)
+    if "-" in t or "−" in t or "–" in t:
+        return True
+    if "(" in t and ")" in t:
+        return True
+    return False
+
+
+def get_foreign_gross_net_consideration_other(row_json):
+    """
+    For OTHER (UBS Call Deposit): preserve sign for amounts.
+    - Prefer reading from 'Transaction value' last cell (same as old logic)
+    - Parse signed float, keep '-' or parentheses if present
+    - If OCR lost '-', use booking_text heuristic:
+        Reduction / Repayment  -> negative
+        Interest Cap.         -> positive
+    Return: (gross, net, accrued_interest)
+    """
+    booking_text = " ".join(row_json.get("Booking text", [])).strip()
+    booking_text = booking_text.replace("\n", " ").strip()
+    bt_low = booking_text.lower()
+
+    txv = row_json.get("Transaction value", [])
+
+    # choose values similarly to old logic (but we keep sign)
+    if booking_text == "Sale Spot" and len(txv) >= 3:
+        gross_raw = txv[0]
+        net_raw = txv[-1]
+        accrued_interest = txv[1]
+    else:
+        gross_raw = txv[-1] if txv else ""
+        net_raw = gross_raw
+        accrued_interest = ""
+
+    gross_val = _parse_signed_number_string(gross_raw)
+    net_val = _parse_signed_number_string(net_raw)
+
+    # heuristic sign fix ONLY for other:
+    # reduction/repayment typically outflow -> negative
+    should_be_negative = ("reduction" in bt_low) or ("repayment" in bt_low)
+    should_be_positive = ("interest cap" in bt_low) or ("interest" in bt_low)
+
+    # If OCR lost sign (we detect no sign hint) and value is positive, apply heuristic
+    if isinstance(gross_val, (int, float)) and gross_val > 0:
+        if should_be_negative and (not _is_negative_hint_text(gross_raw)):
+            gross_val = -gross_val
+    if isinstance(net_val, (int, float)) and net_val > 0:
+        if should_be_negative and (not _is_negative_hint_text(net_raw)):
+            net_val = -net_val
+
+    # if heuristic says positive, ensure positive
+    if isinstance(gross_val, (int, float)) and gross_val < 0 and should_be_positive and (not should_be_negative):
+        gross_val = abs(gross_val)
+    if isinstance(net_val, (int, float)) and net_val < 0 and should_be_positive and (not should_be_negative):
+        net_val = abs(net_val)
+
+    # normalize empty
+    if gross_val == "":
+        gross_val = 0.0
+    if net_val == "":
+        net_val = 0.0
+
+    return gross_val, net_val, accrued_interest
+
+
 # -----------------------------
-# Position helpers (as you already had in previous versions)
+# Position helpers
 # -----------------------------
 def get_currency_position(row_json):
     for e in currencies:
