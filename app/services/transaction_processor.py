@@ -27,11 +27,32 @@ class TransactionProcessor:
         ocr_box = ocr_result[0]["rec_boxes"]
         ocr_text = ocr_result[0]["rec_texts"]
 
+        # ---------------------------------------------------------
+        # ✅ PRE-COMPUTE HEADER INDEX + HEADER BOX PER COLUMN
+        # To avoid duplicate header text and ensure consistent columns
+        # ---------------------------------------------------------
+        header_idx_map = {}
+        header_box_map = {}
+        for col_name in transaction_columns:
+            idx_header = get_index_by_name(col_name, ocr_text)
+            header_idx_map[col_name] = idx_header
+            if idx_header is not None:
+                header_box_map[col_name] = ocr_box[idx_header]
+            else:
+                header_box_map[col_name] = None
+
         row_list = []
         for yolo_box in sorted_det_boxes:
-            indices, _ = ocr_boxes_inside_yolo(yolo_box, ocr_box, threshold=0.9)
-            result = [ocr_text[i] for i in indices]
-            row_list.append({"text": result, "index": indices})
+            try:
+                # ✅ Extend to left margin (same as PositionProcessor)
+                yolo_box[0] = 0
+
+                # ✅ slightly relax threshold to avoid missing OCR boxes in row
+                indices, _ = ocr_boxes_inside_yolo(yolo_box, ocr_box, threshold=0.8)
+                result = [ocr_text[i] for i in indices]
+                row_list.append({"text": result, "index": indices})
+            except Exception:
+                continue
 
         trade_information = []
         fx_tf_information = []
@@ -39,18 +60,25 @@ class TransactionProcessor:
 
         for row in row_list:
             try:
-                row["text"] = [e.strip() for e in row["text"]]
+                row["text"] = [e.strip() for e in row["text"] if isinstance(e, str)]
+                if not row["text"]:
+                    continue
+
+                # Skip obvious headers
                 if is_header(row["text"]):
                     continue
 
                 row_json = {}
+
+                # Build row_json by aligning row boxes under each header column
                 for col_name in transaction_columns:
-                    idx_header = get_index_by_name(col_name, ocr_text)
-                    if idx_header is None:
+                    idx_header = header_idx_map.get(col_name)
+                    col_name_box = header_box_map.get(col_name)
+
+                    if idx_header is None or col_name_box is None:
                         row_json[col_name] = []
                         continue
 
-                    col_name_box = ocr_box[idx_header]
                     ocr_box_of_current_row = [ocr_box[i] for i in row["index"]]
                     ocr_text_of_current_row = [ocr_text[i] for i in row["index"]]
 
@@ -58,9 +86,23 @@ class TransactionProcessor:
                         col_name_box,
                         ocr_box_of_current_row,
                         min_overlap_ratio=0.2,
-                        center_within=False
+                        center_within=False,
+                        below_header_only=True,   # ✅ CRITICAL FIX
+                        y_gap_tol=2.0
                     )
                     row_json[col_name] = [ocr_text_of_current_row[i] for i in aligned_indices]
+
+                # ---------------------------------------------------------
+                # ✅ HARD ROW VALIDATION (reduce false positives / noisy rows)
+                # ---------------------------------------------------------
+                booking_text_join = " ".join(row_json.get("Booking text", [])).strip()
+                trade_date, settlement_date = get_trade_settlement_date(row_json)
+
+                # If not a real transaction row, skip
+                if not booking_text_join:
+                    continue
+                if not trade_date and not settlement_date:
+                    continue
 
                 row_excel = {}
                 transaction_type = get_transaction_type(row_json)
@@ -73,19 +115,18 @@ class TransactionProcessor:
                     transaction_type_out = "Buy" if transaction_type == "Purchase" else "Sell"
 
                     isin = get_isin(row_json)
-                    trade_date, settlement_date = get_trade_settlement_date(row_json)
                     currency = get_currency(row_json)
 
                     custody_lines = row_json.get("Custody account", [])
-
                     security_name_raw = build_security_name_from_custody_account_lines(custody_lines)
 
+                    # fallback if empty
                     if not security_name_raw:
                         fallback_lines = []
                         for ln in custody_lines:
                             if not ln:
                                 continue
-                            t = re.sub(r"\s+", " ", ln).strip()
+                            t = re.sub(r"\s+", " ", str(ln)).strip()
                             if not t:
                                 continue
                             low = t.lower()
@@ -119,6 +160,14 @@ class TransactionProcessor:
 
                     net_consideration = foreign_net_consideration if accrued_interest != "" else ""
 
+                    # ✅ more validation to avoid junk rows counted as trades
+                    if not isin:
+                        continue
+                    if quantity is None or quantity == "":
+                        continue
+                    if not account_no:
+                        continue
+
                     row_excel["Client name"] = "GINKGO TREE GLOBAL ALLOCATION FUND"
                     row_excel["Name/ Security"] = security_name
                     row_excel["Securities ID"] = isin
@@ -143,7 +192,6 @@ class TransactionProcessor:
                 # =========================
                 elif transaction_type == "UBS Call Deposit":
                     isin = get_isin(row_json)
-                    trade_date, settlement_date = get_trade_settlement_date(row_json)
 
                     row_excel["Client name"] = "GINKGO TREE GLOBAL ALLOCATION FUND"
                     row_excel["Description"] = row_json["Booking text"][0].strip() if row_json.get("Booking text") else ""
@@ -172,8 +220,6 @@ class TransactionProcessor:
                 # FX Forward
                 # =========================
                 elif transaction_type == "FX Forward":
-                    trade_date, settlement_date = get_trade_settlement_date(row_json)
-
                     rate = get_fx_forward_rate(row_json)
                     if rate == "":
                         continue
@@ -197,8 +243,11 @@ class TransactionProcessor:
 
                     fx_tf_information.append(row_excel)
 
-            except Exception as e:
-                print(f"[WARN] Transaction row skipped due to error: {e}")
+                else:
+                    # unknown type -> skip
+                    continue
+
+            except Exception:
                 continue
 
         return {
