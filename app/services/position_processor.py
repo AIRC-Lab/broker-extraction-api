@@ -135,6 +135,8 @@ class PositionProcessor:
 
                     currency = get_currency_position(row_json)
                     isin = get_isin_position(row_json)
+
+                    # existing quantity logic
                     amount = get_position_amount(row_json, self.position_type)
 
                     # -------------------------------------------------------
@@ -153,6 +155,19 @@ class PositionProcessor:
                         security_name = security_name_raw
 
                     security_name = re.sub(r"\s+", " ", (security_name or "")).strip()
+
+                    # =========================================================
+                    # ✅ FIX ONLY: Fill missing Quantity/Amount from Security line
+                    # Keep name logic unchanged, only fill 'amount' when missing.
+                    # Use position-specific splitter (handles OCR "o/O" -> 0 etc.)
+                    # =========================================================
+                    try:
+                        if amount == "" or amount is None:
+                            extracted_qty_pos, _cleaned_name_pos = split_leading_quantity_position(security_name_raw)
+                            if extracted_qty_pos is not None:
+                                amount = extracted_qty_pos
+                    except Exception:
+                        pass
 
                     cost_price = get_position_cost_price(row_json, self.position_type)
                     market_price = get_market_price(row_json, self.position_type)
