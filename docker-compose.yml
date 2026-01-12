@@ -17,6 +17,7 @@ services:
     volumes:
       - ./uploaded_pdfs:/app/uploaded_pdfs
       - ./cache/.paddlex/:/root/.paddlex/
+      - ./outputs:/app/outputs
       - ./:/app/
     ports:
       - "8022:8000"

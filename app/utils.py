@@ -440,11 +440,14 @@ def _extract_fx_amount_line(lines: List[str], verb: str):
         if verb_key not in low_compact:
             continue
 
+        verb_pattern = ''.join([ch + r'\s*' for ch in verb])
+
         m = re.search(
-            rf"\byou\s*{''.join([ch + r'\s*' for ch in verb])}\s*([A-Z]{{3}})\s*([+\-]?\d[\d\s,\.()\-]*)",
+            rf"\byou\s*{verb_pattern}\s*([A-Z]{{3}})\s*([+\-]?\d[\d\s,\.()\-]*)",
             t,
             flags=re.IGNORECASE
         )
+
         if not m:
             mm = re.search(r"\b([A-Z]{3})\s+([+\-]?\d[\d\s,\.()\-]*)", t)
             if not mm:
