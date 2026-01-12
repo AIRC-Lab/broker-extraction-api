@@ -1,8 +1,6 @@
 from typing import List, Any
-
 from PIL import Image
 from app.utils import *
-
 import math
 import numpy as np
 import re
@@ -68,21 +66,42 @@ class TransactionProcessor:
                 transaction_type = get_transaction_type(row_json)
 
                 # =========================
-                # Purchase / Sale (Trade)
+                # Purchase / Sale → Buy / Sell
                 # =========================
                 if transaction_type in ["Purchase", "Sale"]:
+
+                    transaction_type_out = "Buy" if transaction_type == "Purchase" else "Sell"
+
                     isin = get_isin(row_json)
                     trade_date, settlement_date = get_trade_settlement_date(row_json)
                     currency = get_currency(row_json)
 
                     custody_lines = row_json.get("Custody account", [])
+
                     security_name_raw = build_security_name_from_custody_account_lines(custody_lines)
+
                     if not security_name_raw:
-                        security_name_raw = " ".join(custody_lines).strip()
+                        fallback_lines = []
+                        for ln in custody_lines:
+                            if not ln:
+                                continue
+                            t = re.sub(r"\s+", " ", ln).strip()
+                            if not t:
+                                continue
+                            low = t.lower()
+                            if low.startswith("you bought") or low.startswith("you sold"):
+                                continue
+                            if "isin" in low:
+                                continue
+                            if is_account_no_like(t):
+                                break
+                            fallback_lines.append(t)
+                            if len(fallback_lines) >= 2:
+                                break
+                        security_name_raw = " ".join(fallback_lines).strip()
 
                     quantity = get_quantity(row_json)
 
-                    # ✅ ALWAYS split if leading looks like quantity
                     extracted_qty, cleaned_name = split_leading_quantity_general(security_name_raw)
                     if extracted_qty is not None:
                         security_name = re.sub(r"\s+", " ", cleaned_name).strip()
@@ -94,15 +113,16 @@ class TransactionProcessor:
 
                     account_no = get_account_no(row_json)
                     foreign_unit_price = get_foreign_unit_price(row_json, transaction_type)
-                    foreign_gross_consideration, foreign_net_consideration, accrued_interest = get_foreign_gross_net_consideration(
-                        row_json, transaction_type
-                    )
+
+                    foreign_gross_consideration, foreign_net_consideration, accrued_interest = \
+                        get_foreign_gross_net_consideration(row_json, transaction_type)
+
                     net_consideration = foreign_net_consideration if accrued_interest != "" else ""
 
                     row_excel["Client name"] = "GINKGO TREE GLOBAL ALLOCATION FUND"
                     row_excel["Name/ Security"] = security_name
                     row_excel["Securities ID"] = isin
-                    row_excel["Transaction type"] = transaction_type
+                    row_excel["Transaction type"] = transaction_type_out
                     row_excel["Trade date"] = trade_date
                     row_excel["Settlement date"] = settlement_date
                     row_excel["Currency"] = currency
@@ -119,7 +139,7 @@ class TransactionProcessor:
                     trade_information.append(row_excel)
 
                 # =========================
-                # UBS Call Deposit
+                # UBS Call Deposit (OTHER)
                 # =========================
                 elif transaction_type == "UBS Call Deposit":
                     isin = get_isin(row_json)
@@ -135,12 +155,13 @@ class TransactionProcessor:
                     row_excel["Quantity"] = ""
                     row_excel["Foreign Unit Price/ Interest rate"] = ""
 
-                    foreign_gross_consideration, _, accrued_interest = get_foreign_gross_net_consideration(
-                        row_json, transaction_type
-                    )
+                    # ✅ FIX ONLY HERE: keep negative sign for OTHER
+                    foreign_gross_consideration, foreign_net_consideration, accrued_interest = \
+                        get_foreign_gross_net_consideration_other(row_json)
+
                     row_excel["Foreign Gross Amount/Interest"] = foreign_gross_consideration
                     row_excel["Tax rate (%)"] = ""
-                    row_excel["Foreign Net Amount"] = row_excel["Foreign Gross Amount/Interest"]
+                    row_excel["Foreign Net Amount"] = foreign_net_consideration
                     row_excel["Payment mode"] = ""
                     row_excel["Account no."] = get_account_no(row_json)
                     row_excel["Exrate to GST"] = ""
@@ -154,11 +175,16 @@ class TransactionProcessor:
                 elif transaction_type == "FX Forward":
                     trade_date, settlement_date = get_trade_settlement_date(row_json)
 
+                    # ✅ FIX: skip row that is NOT truly FX Forward (row from other section)
+                    rate = get_fx_forward_rate(row_json)
+                    if rate == "":
+                        continue
+
                     row_excel["Client name"] = "GINKGO TREE GLOBAL ALLOCATION FUND"
                     row_excel["Transaction type"] = transaction_type
                     row_excel["Trade date"] = trade_date
                     row_excel["Settlement date"] = settlement_date
-                    row_excel["Rate"] = row_json["Cost/Purchase price"][0].strip() if row_json.get("Cost/Purchase price") else ""
+                    row_excel["Rate"] = rate
 
                     currency_buy, amount_buy = get_currency_amount_buy(row_json)
                     currency_sell, amount_sell = get_currency_amount_sell(row_json)
@@ -173,7 +199,7 @@ class TransactionProcessor:
 
                     fx_tf_information.append(row_excel)
 
-            except:
+            except Exception:
                 continue
 
         return {
