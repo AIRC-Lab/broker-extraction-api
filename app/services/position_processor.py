@@ -12,6 +12,7 @@ class PositionProcessor:
 
     def __init__(self) -> None:
         self.position_type = None
+        self.portfolio_no = None
 
     def process(
         self,
@@ -89,7 +90,7 @@ class PositionProcessor:
                     account_no = row_json["Description"][-1] if row_json.get("Description") else ""
                     amount = get_liquidity_amount(row_json)
 
-                    row_excel["Portfolio No."] = "546-880515-01"
+                    row_excel["Portfolio No."] = self.portfolio_no or ""
                     row_excel["Type"] = self.position_type
                     row_excel["Account No"] = account_no
                     row_excel["Currency"] = currency
@@ -159,7 +160,7 @@ class PositionProcessor:
                     market_price = get_market_price(row_json, self.position_type)
                     market_value = get_market_value(row_json, self.position_type)
 
-                    row_excel["Portfolio No."] = "546-880515-01"
+                    row_excel["Portfolio No."] = self.portfolio_no or ""
                     row_excel["Type"] = self.position_type
                     row_excel["Account No"] = ""
                     row_excel["Currency"] = currency

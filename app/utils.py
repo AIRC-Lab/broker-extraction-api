@@ -1,6 +1,7 @@
 from typing import List, Tuple
 from datetime import datetime
 import re
+from decimal import Decimal, InvalidOperation
 
 Box = Tuple[float, float, float, float]  # (x1, y1, x2, y2)
 
@@ -291,9 +292,9 @@ def get_trade_settlement_date(row_json):
 
 def is_number(s: str) -> bool:
     try:
-        float(s)
-        return True
-    except ValueError:
+        v = _parse_signed_number_string(s)
+        return v != ""
+    except Exception:
         return False
 
 
@@ -302,7 +303,8 @@ def get_quantity(row_json):
         return None
     number_amount = row_json["Transaction Tax"][0]
     if is_number(number_amount):
-        return float(number_amount)
+        v = _parse_signed_number_string(number_amount)
+        return v
     else:
         amount = ""
         first_e_split = number_amount.split()
@@ -310,13 +312,44 @@ def get_quantity(row_json):
             if is_number(e):
                 amount = amount + e
         if len(amount) > 0:
-            return float(amount)
+            return _parse_signed_number_string(amount)
     return None
 
 
 def get_account_no(row_json):
     account_no_list = extract_account_numbers("\n".join(row_json.get("Custody account", [])))
     return account_no_list[-1] if account_no_list else ""
+
+
+def extract_portfolio_numbers(text: str):
+    """
+    Extract portfolio numbers like 546-880515-01
+    """
+    pattern = r"\b\d{3}-\d{6}-\d{2}\b"
+    return re.findall(pattern, text)
+
+
+def get_portfolio_no_from_text(text: str):
+    nums = extract_portfolio_numbers(text)
+    return nums[0] if nums else ""
+
+
+def get_client_name_from_text(text: str):
+    """
+    Heuristic: prefer a line that contains the word 'FUND' (case-insensitive).
+    Fallback: return first all-uppercase short line.
+    """
+    if not text:
+        return ""
+    for line in text.splitlines():
+        if 'FUND' in line.upper():
+            return line.strip()
+
+    # fallback: look for an uppercase-ish short line
+    candidates = [l.strip() for l in text.splitlines() if l.strip() and l.strip() == l.strip().upper() and 2 <= len(l.split()) <= 6]
+    if candidates:
+        return candidates[0]
+    return ""
 
 
 def get_foreign_unit_price(row_json, transaction_type):
@@ -348,15 +381,25 @@ def get_foreign_gross_net_consideration(row_json, transaction_type):
         foreign_net_consideration = foreign_gross_consideration
         accrued_interest = ""
 
-    foreign_gross_consideration = re.sub(r"[^0-9.]", "", str(foreign_gross_consideration)).strip()
-    foreign_gross_consideration = re.sub(r"\s+", "", foreign_gross_consideration).strip()
-    foreign_gross_consideration = abs(float(foreign_gross_consideration)) if foreign_gross_consideration else 0.0
+    # parse using Decimal-aware helper to preserve precision and separators
+    fg = _parse_signed_number_string(foreign_gross_consideration)
+    fn = _parse_signed_number_string(foreign_net_consideration)
 
-    foreign_net_consideration = re.sub(r"[^0-9.]", "", str(foreign_net_consideration)).strip()
-    foreign_net_consideration = re.sub(r"\s+", "", foreign_net_consideration).strip()
-    foreign_net_consideration = abs(float(foreign_net_consideration)) if foreign_net_consideration else 0.0
+    if fg == "":
+        fg = Decimal('0')
+    if fn == "":
+        fn = Decimal('0')
 
-    return foreign_gross_consideration, foreign_net_consideration, accrued_interest
+    try:
+        fg = abs(Decimal(fg))
+    except Exception:
+        fg = Decimal('0')
+    try:
+        fn = abs(Decimal(fn))
+    except Exception:
+        fn = Decimal('0')
+
+    return fg, fn, accrued_interest
 
 
 # =========================
@@ -390,17 +433,49 @@ def _parse_signed_number_string(num_str: str):
         return ""
 
     # remove parentheses for parsing
-    s_clean = s_clean.replace("(", "").replace(")", "")
+    s_no_paren = s_clean.replace("(", "").replace(")", "")
 
-    # remove thousand separators (space/comma)
-    s_clean = s_clean.replace(" ", "").replace(",", "")
+    # Decide decimal separator: if both '.' and ',' present, assume the rightmost symbol is decimal separator
+    dot_pos = s_no_paren.rfind('.')
+    comma_pos = s_no_paren.rfind(',')
+    decimal_sep = None
+    thousand_seps = [' ']
+    if dot_pos != -1 and comma_pos != -1:
+        if comma_pos > dot_pos:
+            decimal_sep = ','
+        else:
+            decimal_sep = '.'
+    elif comma_pos != -1 and dot_pos == -1:
+        # ambiguous: could be decimal comma or thousand separator. Heuristic: if comma followed by 3 digits, treat as thousand sep
+        m = re.search(r",\d{3}(?:[^\d]|$)", s_no_paren)
+        if m:
+            decimal_sep = None
+        else:
+            decimal_sep = ','
+    else:
+        decimal_sep = '.'
+
+    # remove thousand separators and normalize decimal separator to dot
+    normalized = s_no_paren
+    # remove spaces always
+    normalized = normalized.replace(' ', '')
+    if decimal_sep == ',':
+        # remove dots (thousand) if any, replace comma with dot
+        normalized = normalized.replace('.', '')
+        normalized = normalized.replace(',', '.')
+    else:
+        # decimal is dot: remove commas
+        normalized = normalized.replace(',', '')
+
+    # final cleanup: keep only digits, sign, dot
+    normalized = re.sub(r"[^0-9\-\+\.]", "", normalized)
 
     try:
-        val = float(s_clean)
+        val = Decimal(normalized)
         if neg_by_paren and val > 0:
             val = -val
         return val
-    except:
+    except (InvalidOperation, ValueError):
         return ""
 
 
@@ -434,7 +509,7 @@ def _extract_ccy_amount_pairs(lines: List[str]):
             ccy = (m.group(1) or "").strip()
             amt_raw = (m.group(2) or "").strip()
             amt = _parse_signed_number_string(amt_raw)
-            if ccy and isinstance(amt, (int, float)):
+            if ccy and isinstance(amt, (int, float, Decimal)):
                 pairs.append((ccy, amt))
 
     # dedupe while keeping order
@@ -491,7 +566,7 @@ def _extract_fx_amount_line(lines: List[str], verb: str):
             cur = (m.group(1) or "").strip()
             amt = _parse_signed_number_string((m.group(2) or "").strip())
 
-        if verb == "sold" and isinstance(amt, (int, float)):
+        if verb == "sold" and isinstance(amt, (int, float, Decimal)):
             # enforce negative if OCR lost sign
             if amt > 0:
                 amt = -amt
@@ -507,7 +582,7 @@ def _extract_fx_amount_line(lines: List[str], verb: str):
         if verb == "bought":
             return buy_ccy, buy_amt
         else:
-            if isinstance(sell_amt, (int, float)) and sell_amt > 0:
+            if isinstance(sell_amt, (int, float, Decimal)) and sell_amt > 0:
                 sell_amt = -sell_amt
             return sell_ccy, sell_amt
 
@@ -541,14 +616,14 @@ def get_fx_forward_rate(row_json):
         if not t:
             continue
 
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", t)
+        m = re.search(r"([0-9]+(?:[\.,][0-9]+)?)", t)
         if not m:
             continue
 
-        rate_str = m.group(1)
+        rate_str = m.group(1).replace(',', '.')
         try:
-            return float(rate_str)
-        except:
+            return Decimal(rate_str)
+        except Exception:
             continue
 
     return ""
@@ -612,8 +687,8 @@ def split_leading_quantity_general(text: str):
 
     qty_norm = qty_raw.replace(" ", "").replace(",", "")
     try:
-        qty = float(qty_norm)
-    except:
+        qty = Decimal(qty_norm)
+    except Exception:
         return None, s
 
     return qty, rest
@@ -655,8 +730,8 @@ def split_leading_quantity_position(text: str):
         return None, s
 
     try:
-        qty = float(qty_digits)
-    except:
+        qty = Decimal(qty_digits)
+    except Exception:
         return None, s
 
     rest = re.sub(r"\s+", " ", rest).strip()
@@ -805,24 +880,24 @@ def get_foreign_gross_net_consideration_other(row_json):
     should_be_positive = ("interest cap" in bt_low) or ("interest" in bt_low)
 
     # If OCR lost sign (we detect no sign hint) and value is positive, apply heuristic
-    if isinstance(gross_val, (int, float)) and gross_val > 0:
+    if isinstance(gross_val, (int, float, Decimal)) and gross_val > 0:
         if should_be_negative and (not _is_negative_hint_text(gross_raw)):
             gross_val = -gross_val
-    if isinstance(net_val, (int, float)) and net_val > 0:
+    if isinstance(net_val, (int, float, Decimal)) and net_val > 0:
         if should_be_negative and (not _is_negative_hint_text(net_raw)):
             net_val = -net_val
 
     # if heuristic says positive, ensure positive
-    if isinstance(gross_val, (int, float)) and gross_val < 0 and should_be_positive and (not should_be_negative):
+    if isinstance(gross_val, (int, float, Decimal)) and gross_val < 0 and should_be_positive and (not should_be_negative):
         gross_val = abs(gross_val)
-    if isinstance(net_val, (int, float)) and net_val < 0 and should_be_positive and (not should_be_negative):
+    if isinstance(net_val, (int, float, Decimal)) and net_val < 0 and should_be_positive and (not should_be_negative):
         net_val = abs(net_val)
 
     # normalize empty
     if gross_val == "":
-        gross_val = 0.0
+        gross_val = Decimal('0')
     if net_val == "":
-        net_val = 0.0
+        net_val = Decimal('0')
 
     return gross_val, net_val, accrued_interest
 
@@ -880,7 +955,10 @@ def get_position_amount(row_json, position_type):
             amount = row_json["By investment category"][-4]
 
         amount = amount.replace(" ", "")
-        return float(amount) if amount else ""
+        try:
+            return Decimal(amount) if amount else ""
+        except Exception:
+            return ""
     except:
         return ""
 
@@ -889,11 +967,21 @@ def get_position_cost_price(row_json, position_type):
     try:
         texts = row_json.get("Cost price", [])
         cost_price = texts[0]
-        cost_price = re.sub(r'[^0-9.%]+', '', cost_price)
-        if "%" in cost_price:
-            return float(cost_price.strip('%')) / 100
-        cost_price = float(cost_price)
-        return cost_price
+        # find numeric token (including commas/dots/percent)
+        m = re.search(r"([+\-]?[0-9\s\.,()]+%?)", cost_price)
+        if not m:
+            return ""
+        token = m.group(1)
+        if '%' in token:
+            token_clean = token.replace('%', '').strip()
+            val = _parse_signed_number_string(token_clean)
+            try:
+                return Decimal(val) / Decimal('100')
+            except Exception:
+                return ""
+        else:
+            val = _parse_signed_number_string(token)
+            return val if val != "" else ""
     except:
         return ""
 
@@ -901,11 +989,19 @@ def get_position_cost_price(row_json, position_type):
 def get_market_price(row_json, position_type):
     try:
         text = row_json.get("Market price", [])[0]
-        market_price = re.sub(r"[^0-9%.]", "", text).strip()
-        if "%" in market_price:
-            return float(market_price.strip('%')) / 100
+        m = re.search(r"([+\-]?[0-9\s\.,()]+%?)", text)
+        if not m:
+            return ""
+        token = m.group(1)
+        if '%' in token:
+            v = _parse_signed_number_string(token.replace('%', ''))
+            try:
+                return Decimal(v) / Decimal('100')
+            except Exception:
+                return ""
         else:
-            return float(market_price)
+            v = _parse_signed_number_string(token)
+            return v if v != "" else ""
     except:
         return ""
 
@@ -913,11 +1009,19 @@ def get_market_price(row_json, position_type):
 def get_market_value(row_json, position_type):
     try:
         text = row_json.get("Market value", [])[0]
-        market_value = re.sub(r"[^0-9.]", "", text).strip()
-        if "%" in market_value:
-            return float(market_value.strip('%')) / 100
+        m = re.search(r"([+\-]?[0-9\s\.,()]+%?)", text)
+        if not m:
+            return ""
+        token = m.group(1)
+        if '%' in token:
+            v = _parse_signed_number_string(token.replace('%', ''))
+            try:
+                return Decimal(v) / Decimal('100')
+            except Exception:
+                return ""
         else:
-            return float(market_value)
+            v = _parse_signed_number_string(token)
+            return v if v != "" else ""
     except:
         return ""
 
@@ -968,18 +1072,27 @@ def get_liquidity_amount(row_json):
         try:
             amount = row_json["Description"][0].lower().split("ubs")[0].strip()
             amount = amount.replace(" ", "")
-            amount = float(amount)
+            try:
+                amount = Decimal(amount)
+            except Exception:
+                amount = ""
         except:
             amount = ""
     elif len(row_json.get("By investment category", [])) == 2:
         amount_str = row_json["By investment category"][-1]
         try:
-            amount = float(amount_str.replace(" ", ""))
+            try:
+                amount = Decimal(amount_str.replace(" ", ""))
+            except Exception:
+                amount = Decimal(amount_str.replace(" ", "").replace(',', ''))
         except:
             try:
                 amount = row_json["Description"][0].lower().split("ubs")[0].strip()
                 amount = amount.replace(" ", "")
-                amount = float(amount)
+                try:
+                    amount = Decimal(amount)
+                except Exception:
+                    amount = Decimal(amount.replace(',', ''))
             except:
                 amount = ''
     return amount

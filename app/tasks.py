@@ -5,6 +5,7 @@ import shutil
 
 from app.services.pdf_processor import pdf_processor
 from app.services.excel_exporter import excel_exporter
+from app.utils import get_client_name_from_text, get_portfolio_no_from_text
 
 # Initialize Celery app
 celery_app = Celery(
@@ -53,6 +54,18 @@ def process_pdf_task(self, pdf_path: str):
         page_images = pdf_processor.pdf_to_images(pdf_path)
 
         extracted_data_list = {"position": [], "transaction": {"trade": [], "fx_tf": [], "other": []}}
+
+        # Extract per-PDF metadata (client name, portfolio no.) from first page OCR
+        try:
+            if page_images:
+                first_ocr = pdf_processor.perform_ocr(page_images[0])
+                full_text = " ".join(first_ocr[0].get("rec_texts", [])) if first_ocr and first_ocr[0] else ""
+                client_name = get_client_name_from_text(full_text)
+                portfolio_no = get_portfolio_no_from_text(full_text)
+                pdf_processor.transaction_processor.client_name = client_name
+                pdf_processor.postion_processor.portfolio_no = portfolio_no
+        except Exception:
+            pass
 
         for i, image in enumerate(page_images):
             self.update_state(

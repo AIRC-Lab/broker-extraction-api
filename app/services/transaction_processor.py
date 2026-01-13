@@ -11,7 +11,7 @@ class TransactionProcessor:
     from OCR results using a YOLO object detection model."""
 
     def __init__(self) -> None:
-        pass
+        self.client_name = None
 
     def process(
         self,
@@ -168,7 +168,7 @@ class TransactionProcessor:
                     if not account_no:
                         continue
 
-                    row_excel["Client name"] = "GINKGO TREE GLOBAL ALLOCATION FUND"
+                    row_excel["Client name"] = self.client_name or ""
                     row_excel["Name/ Security"] = security_name
                     row_excel["Securities ID"] = isin
                     row_excel["Transaction type"] = transaction_type_out
@@ -193,7 +193,7 @@ class TransactionProcessor:
                 elif transaction_type == "UBS Call Deposit":
                     isin = get_isin(row_json)
 
-                    row_excel["Client name"] = "GINKGO TREE GLOBAL ALLOCATION FUND"
+                    row_excel["Client name"] = self.client_name or ""
                     row_excel["Description"] = row_json["Booking text"][0].strip() if row_json.get("Booking text") else ""
                     row_excel["Securities ID"] = isin
                     row_excel["Transaction type"] = transaction_type
@@ -224,7 +224,7 @@ class TransactionProcessor:
                     if rate == "":
                         continue
 
-                    row_excel["Client name"] = "GINKGO TREE GLOBAL ALLOCATION FUND"
+                    row_excel["Client name"] = self.client_name or ""
                     row_excel["Transaction type"] = transaction_type
                     row_excel["Trade date"] = trade_date
                     row_excel["Settlement date"] = settlement_date
