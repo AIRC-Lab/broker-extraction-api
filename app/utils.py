@@ -435,7 +435,20 @@ def get_client_name_from_text(text: str):
     if not text:
         return ""
 
-    lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
+    # normalize whitespace
+    text_norm = re.sub(r"\s+", " ", text or "").strip()
+    # split into lines when available; if text is a single long line (from tasks.py),
+    # also create candidate fragments by splitting on common separators.
+    raw_lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    if len(raw_lines) <= 1:
+        # create fragments from the single long line
+        frags = re.split(r"\s{2,}|\s-\s|\s\|\s|\s:\s|\s/\s|\s—\s|\s–\s", text_norm)
+        lines = [f.strip() for f in frags if f.strip()]
+        # ensure we also keep the original long line as fallback
+        if text_norm and text_norm not in lines:
+            lines.insert(0, text_norm)
+    else:
+        lines = [re.sub(r"\s+", " ", l).strip() for l in raw_lines if l.strip()]
 
     def sanitize_name(ln: str) -> str:
         s = ln.strip()
@@ -473,6 +486,25 @@ def get_client_name_from_text(text: str):
         if is_account_no_like(ln_s) or re.fullmatch(r"[\d\s\-\./]+", ln_s):
             continue
         candidates.append(ln_s)
+
+    # If tasks.py provided a flattened full_text, try targeted extraction around 'portfolio'
+    low_text = text_norm.lower()
+    if 'portfolio' in low_text and (not candidates or len(candidates) == 1 and len(candidates[0].split()) > 10):
+        # look for 'portfolio' and take preceding fragment as candidate
+        m = re.search(r"(.{0,200})\bportfolio\b", low_text)
+        if m:
+            before = text_norm[:m.start(0)].strip()
+            parts = re.split(r"\s{2,}|\s-\s|\s\|\s|\s:\s", before)
+            for p in reversed(parts):
+                p = p.strip()
+                if not p:
+                    continue
+                if any(ch.isdigit() for ch in p) and len(p.split()) > 6:
+                    continue
+                if is_account_no_like(p):
+                    continue
+                candidates.insert(0, p)
+                break
 
     if not candidates:
         return sanitize_name(lines[0]) if lines else ""
@@ -975,6 +1007,22 @@ def build_security_name_from_custody_account_lines(lines: List[str]) -> str:
 
     name = " ".join(cleaned_name_lines).strip()
     name = re.sub(r"\s+", " ", name).strip()
+    # remove leading quantity if present (e.g., '100 000 Foo Bar')
+    try:
+        qty, rest = split_leading_quantity_general(name)
+        if qty is not None and rest:
+            name = rest
+    except Exception:
+        pass
+
+    # remove common account tokens, trailing dates, ISIN tokens and stray punctuation
+    name = re.sub(r"\bISIN\b[:\s]*[A-Z0-9\-]+", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\b\d{3}-\d{6}(?:-[\dA-Z]+)?\b", "", name)
+    name = re.sub(r"\b(as of|as at|dated)\b.*", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\s*\([^)]*\)\s*", " ", name)  # remove parenthesized qualifiers
+    name = re.sub(r"[\)\(\"\']+", "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+
     return name
 
 
@@ -1262,8 +1310,27 @@ def get_security_name(row_json, position_type):
         return desc[1] if len(desc) > 1 else ""
     else:
         if len(desc) > 1 and not any(char.isdigit() for char in desc[1]):
-            return desc[0] + " " + desc[1]
-        return desc[0]
+            candidate = (desc[0] + " " + desc[1]).strip()
+        else:
+            candidate = desc[0].strip()
+
+    # remove leading quantity tokens (e.g., '2 000 Shs Foo')
+    try:
+        qty, rest = split_leading_quantity_general(candidate)
+        if qty is not None and rest:
+            candidate = rest
+    except Exception:
+        pass
+
+    # strip trailing account/date/ISIN tokens and parenthesis
+    candidate = re.sub(r"\bISIN\b[:\s]*[A-Z0-9\-]+", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\b\d{3}-\d{6}(?:-[\dA-Z]+)?\b", "", candidate)
+    candidate = re.sub(r"\b(as of|as at|dated)\b.*", "", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r"\s*\([^)]*\)\s*", " ", candidate)
+    candidate = re.sub(r"[\)\(\"\']+", "", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+
+    return candidate
 
 
 def get_secuitity_name(row_json, position_type):
