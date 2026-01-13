@@ -496,27 +496,7 @@ def get_client_name_from_text(text: str):
         best = sanitize_name(shortest)
 
     return best
-                cand = lines[j]
-                if cand and not ('portfolio' in cand.lower()) and len(cand.split()) <= 12:
-                    return sanitize_name(cand)
-
-    # prefer a line that contains 'FUND' and is reasonably short
-    for line in lines:
-        if 'fund' in line.lower() and len(line.split()) <= 12:
-            return sanitize_name(line)
-
-    # prefer an uppercase-ish short line (company name often uppercase)
-    for line in lines:
-        if line == line.upper() and 2 <= len(line.split()) <= 10:
-            return sanitize_name(line)
-
-    # fallback: first non-noise line that is not too long
-    for line in lines:
-        if not is_noise_line(line) and len(line.split()) <= 12:
-            return sanitize_name(line)
-
-    # last resort: return first line sanitized
-    return sanitize_name(lines[0]) if lines else ""
+    
 
 
 def get_foreign_unit_price(row_json, transaction_type):
