@@ -195,8 +195,15 @@ For each OCR box candidate:
   1. Calculate horizontal overlap with header box
   2. Min overlap ratio: 20% (default: 0.2)
   3. Optional: Center must be within header bounds
-  4. Include in column if passes check
+  4. Optional: Must be below header (for transactions) ✅ NEW
+  5. Optional: Y-gap tolerance: 2.0 pixels ✅ NEW
+  6. Include in column if passes check
 ```
+
+**New Parameters (Recent Update):**
+
+- `below_header_only`: If True, exclude boxes above header (prevents column misalignment)
+- `y_gap_tol`: Y-coordinate gap tolerance (default 2.0 pixels) for determining if box is below header
 
 ---
 
@@ -296,12 +303,20 @@ For each OCR box candidate:
 
 ## Performance Notes
 
-- **YOLO Row Detection Threshold**: 0.9 (90% overlap required for transaction rows)
+- **YOLO Row Detection Threshold**: 0.8 (80% for both position and transaction rows)
 - **Column Alignment Threshold**: 0.2 (20% overlap required)
+- **OCR Box Filtering Threshold**: 0.8 (slightly relaxed to avoid missing boxes)
+- **Below-Header Check**: 2.0 pixel gap tolerance for transaction alignment
 - **OCR Models Used**:
   - Detection: `PP-OCRv5_server_det`
   - Recognition: `PP-OCRv5_server_rec`
   - YOLO: `yolo_broker_line_detect.pt`
+
+**Recent Optimization (Latest Update):**
+
+- Pre-compute header indices and boxes per column (avoid recalculation)
+- Hard row validation: Check for booking_text and trade/settlement dates
+- Stricter validation: Require ISIN, quantity, and account_no for trade rows
 
 ---
 
@@ -314,6 +329,8 @@ For each OCR box candidate:
 | Special characters   | Remove with regex `[^0-9.\-]` for numbers            |
 | Date formats         | Parse as DD.MM.YYYY, convert to MM/DD/YYYY           |
 | Amount with currency | Extract digits, ignore currency symbols              |
+| Empty text elements  | Filter out empty strings from row_text ✅ NEW        |
+| Noisy rows           | Hard validation: require booking_text, dates ✅ NEW  |
 
 ---
 
