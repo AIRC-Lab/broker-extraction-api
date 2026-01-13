@@ -37,16 +37,34 @@ class PositionProcessor:
             result = [ocr_text[i] for i in indices]
             row_list.append({"text": result, "index": indices})
 
+        skip_is_header_once = False
         for row in row_list:
             try:
                 row_excel = {}
                 row["text"] = [e.strip() for e in row["text"]]
 
                 if is_header(row["text"]):
-                    continue
+                    if skip_is_header_once:
+                        skip_is_header_once = False
+                    else:
+                        continue
 
                 position_type_check = get_position_type(row)
                 if position_type_check != "":
+                    # detect if this is a pure section header (no numeric/currency content)
+                    joined = " ".join(row.get("text", [])).strip()
+                    joined_low = joined.lower()
+                    has_currency = any(ccy.lower() in joined_low for ccy in currencies)
+                    has_isin = "isin" in joined_low
+                    has_percent = "%" in joined
+                    has_decimal_or_longint = bool(re.search(r"\d+\.\d+", joined)) or bool(re.search(r"\d{3,}", joined))
+
+                    if not (has_currency or has_isin or has_percent or has_decimal_or_longint):
+                        # treat as header and allow next row through
+                        self.position_type = position_type_check
+                        skip_is_header_once = True
+                        continue
+
                     self.position_type = position_type_check
 
                 if self.position_type is None:
@@ -96,12 +114,37 @@ class PositionProcessor:
                     row_excel["Currency"] = currency
                     row_excel["Quantity/ Amount"] = amount
                     row_excel["Security ID"] = ""
-                    row_excel["Security name"] = ""
+                    # Derive a security name from Description for liquidity accounts.
+                    desc_lines = row_json.get("Description", [])
+                    security_name = ""
+                    if desc_lines:
+                        # If last line looks like an account number or date, prefer the earlier lines as name
+                        last = desc_lines[-1].strip()
+                        last_low = last.lower()
+                        looks_like_account_or_date = False
+                        if is_account_no_like(last):
+                            looks_like_account_or_date = True
+                        if re.search(r"\b\d{1,2}[\./-]\d{1,2}[\./-]\d{2,4}\b", last):
+                            looks_like_account_or_date = True
+                        if looks_like_account_or_date and len(desc_lines) >= 2:
+                            candidate_lines = desc_lines[:-1]
+                        else:
+                            candidate_lines = desc_lines
+
+                        joined = " ".join([re.sub(r"\s+", " ", l).strip() for l in candidate_lines if l])
+                        # remove embedded account numbers and trailing dates
+                        joined = re.sub(r"\b\d{3}-\d{6}(?:-[\dA-Z]+)?\b", "", joined)
+                        joined = re.sub(r"\b(as of|as at|dated)\b.*", "", joined, flags=re.IGNORECASE)
+                        joined = re.sub(r"\b\d{1,2}[\./-]\d{1,2}[\./-]\d{2,4}\b", "", joined)
+                        joined = re.sub(r"\s+", " ", joined).strip()
+                        security_name = joined
+
+                    row_excel["Security name"] = security_name
                     row_excel["Cost price"] = ""
                     row_excel["Market price"] = ""
                     row_excel["Market value"] = ""
                     row_excel["Accrued interest"] = ""
-                    row_excel["Valuation date"] = ""
+                    row_excel["Valuation date"] = self.valuation_date or ""
 
                     extracted_position_data.append(row_excel)
 
@@ -148,6 +191,20 @@ class PositionProcessor:
 
                     security_name = re.sub(r"\s+", " ", (security_name or "")).strip()
 
+                    # cleanup security name: remove stray parentheses and closing paren characters
+                    # strip leading quantity-like tokens (digits, spaces, commas, dots, O/0)
+                    # and drop header-like short uppercase tokens
+                    if security_name:
+                        security_name = security_name.strip()
+                        security_name = re.sub(r"^[\(\)\s]+|[\(\)\s]+$", "", security_name)
+                        security_name = re.sub(r"^[\d\s,\.oO]+\s+", "", security_name)
+                        try:
+                            if is_header(security_name):
+                                security_name = ""
+                        except Exception:
+                            pass
+                        security_name = security_name.strip()
+
                     try:
                         if amount == "" or amount is None:
                             extracted_qty_pos, _cleaned_name_pos = split_leading_quantity_position(security_name_raw)
@@ -171,7 +228,7 @@ class PositionProcessor:
                     row_excel["Market price"] = market_price
                     row_excel["Market value"] = market_value
                     row_excel["Accrued interest"] = ""
-                    row_excel["Valuation date"] = "03/31/25"
+                    row_excel["Valuation date"] = self.valuation_date or ""
 
                     extracted_position_data.append(row_excel)
 

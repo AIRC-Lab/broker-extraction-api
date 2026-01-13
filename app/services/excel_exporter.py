@@ -20,10 +20,10 @@ class ExcelExporter:
             os.makedirs(output_path, exist_ok=True)
 
         # 1) POSITION
-        postion_data = data.get("position", []) or []
-        df_pos = pd.DataFrame(postion_data)
-        df_pos.to_excel(os.path.join(output_path, "postion.xlsx"), index=False)
-        print(f"[DEBUG] Exported: {os.path.join(output_path, 'postion.xlsx')}")
+        position_data = data.get("position", []) or []
+        df_pos = pd.DataFrame(position_data)
+        df_pos.to_excel(os.path.join(output_path, "position.xlsx"), index=False)
+        print(f"[DEBUG] Exported: {os.path.join(output_path, 'position.xlsx')}")
 
         # 2) TRANSACTIONS (always export 3 files)
         transaction_data = data.get("transaction", {}) or {}

@@ -158,9 +158,41 @@ def boxes_aligned_in_column_idx(
 
 
 def is_header(row):
-    if "Trade date" in row or "Valued in USD" in row or "Value of net positions" in row:
-        return 1
-    return 0
+    # row may be list of tokens or a string
+    if isinstance(row, (list, tuple)):
+        text = " ".join(row)
+    else:
+        text = str(row)
+
+    low = text.lower()
+
+    # quick legacy checks
+    if "trade date" in low or "valued in usd" in low or "value of net positions" in low:
+        return True
+
+    header_keywords = [
+        "description", "number/amount", "cost price", "market price", "market value",
+        "market gain", "transaction value", "booking text", "trade date", "by investment category",
+        "% na", "s&p", "moodys", "duration", "yield", "settlement", "valued in"
+    ]
+
+    hits = sum(1 for k in header_keywords if k in low)
+
+    # explicit column names
+    explicit_hits = 0
+    for col in transaction_columns + position_columns + liquidity_account_columns:
+        if col and col.lower() in low:
+            explicit_hits += 1
+
+    if hits + explicit_hits >= 2:
+        return True
+
+    # uppercase short tokens likely header
+    tokens = text.strip().split()
+    if 1 <= len(tokens) <= 4 and text.strip().isupper():
+        return True
+
+    return False
 
 
 def get_index_by_name(name, texts):
@@ -214,6 +246,66 @@ def convert_date_format(date_str, current_format="%d.%m.%Y", desired_format="%m/
         return date_obj.strftime(desired_format)
     except ValueError:
         return None
+
+
+def get_valuation_date_from_text(text: str):
+    """
+    Extract valuation date from header text. Handles patterns like:
+      - 'Statement of assets as of 31 March 2025'
+      - 'Valuation date: 31.03.2025' (dd.mm.yyyy)
+      - 'Valued as at 31.03.25'
+    Returns MM/DD/YYYY or empty string.
+    """
+    if not text:
+        return ""
+
+    # 1) 'Statement of assets as of 31 March 2025'
+    m = re.search(r"statement of assets.*?as of\s+([0-3]?\d)\s+([A-Za-z]+)\s+(\d{4})", text, flags=re.IGNORECASE)
+    if m:
+        day, mon_name, year = m.group(1), m.group(2), m.group(3)
+        for fmt in ("%d %B %Y", "%d %b %Y"):
+            try:
+                dt = datetime.strptime(f"{day} {mon_name} {year}", fmt)
+                return dt.strftime("%m/%d/%Y")
+            except Exception:
+                continue
+
+    # 2) 'Valuation date: 31.03.2025' or similar
+    m = re.search(r"valuation date[:\s]*([0-3]?\d\.[01]?\d\.(?:\d{2}|\d{4}))", text, flags=re.IGNORECASE)
+    if m:
+        d = m.group(1)
+        parts = d.split('.')
+        if len(parts[-1]) == 2:
+            parts[-1] = '20' + parts[-1]
+            d = '.'.join(parts)
+        out = convert_date_format(d)
+        if out:
+            return out
+
+    # 3) any dd.mm.yy or dd.mm.yyyy elsewhere
+    m = re.search(r"([0-3]?\d\.[01]?\d\.(?:\d{2}|\d{4}))", text)
+    if m:
+        d = m.group(1)
+        parts = d.split('.')
+        if len(parts[-1]) == 2:
+            parts[-1] = '20' + parts[-1]
+            d = '.'.join(parts)
+        out = convert_date_format(d)
+        if out:
+            return out
+
+    # 4) fallback: english date like '31 March 2025'
+    m2 = re.search(r"([0-3]?\d)\s+([A-Za-z]+)\s+(\d{4})", text)
+    if m2:
+        day, mon_name, year = m2.group(1), m2.group(2), m2.group(3)
+        for fmt in ("%d %B %Y", "%d %b %Y"):
+            try:
+                dt = datetime.strptime(f"{day} {mon_name} {year}", fmt)
+                return dt.strftime("%m/%d/%Y")
+            except Exception:
+                continue
+
+    return ""
 
 
 def is_date(string, date_format="%d.%m.%Y"):
@@ -336,20 +428,95 @@ def get_portfolio_no_from_text(text: str):
 
 def get_client_name_from_text(text: str):
     """
-    Heuristic: prefer a line that contains the word 'FUND' (case-insensitive).
-    Fallback: return first all-uppercase short line.
+    Heuristic client name extraction from page header text.
+    Prefer the line immediately after a 'Portfolio number' occurrence (common layout).
+    Otherwise prefer a line containing 'FUND' (case-insensitive), then an uppercase short line.
     """
     if not text:
         return ""
-    for line in text.splitlines():
-        if 'FUND' in line.upper():
-            return line.strip()
 
-    # fallback: look for an uppercase-ish short line
-    candidates = [l.strip() for l in text.splitlines() if l.strip() and l.strip() == l.strip().upper() and 2 <= len(l.split()) <= 6]
-    if candidates:
-        return candidates[0]
-    return ""
+    lines = [re.sub(r"\s+", " ", l).strip() for l in text.splitlines() if l.strip()]
+
+    def sanitize_name(ln: str) -> str:
+        s = ln.strip()
+        s = re.sub(r'page\s*\d+\s*(of\s*\d+)?', '', s, flags=re.IGNORECASE).strip()
+        s = re.sub(r"\b(as of|as at|dated)\b.*", "", s, flags=re.IGNORECASE).strip()
+        s = re.sub(r"\b\d{3}-\d{6}(?:-[\dA-Z]+)?\b", "", s)
+        s = s.strip(' -:\u2014')
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def is_noise(ln: str) -> bool:
+        if not ln:
+            return True
+        low = ln.lower()
+        noise = [
+            'statement', 'portfolio', 'valuation', 'valued', 'page', 'of', 'accounts',
+            'detailed positions', 'transaction list', 'by investment category', 'liquidity',
+            'last purchase', 'statement of assets', 'report', 'dated', 'as of'
+        ]
+        for t in noise:
+            if t in low:
+                return True
+        # very long lines with many digits are likely header block
+        if any(ch.isdigit() for ch in ln) and len(ln.split()) > 10:
+            return True
+        return False
+
+    # gather candidate lines (single lines, not too long)
+    candidates = []
+    for ln in lines:
+        ln_s = ln.strip()
+        if not ln_s:
+            continue
+        # ignore purely numeric or account-like lines
+        if is_account_no_like(ln_s) or re.fullmatch(r"[\d\s\-\./]+", ln_s):
+            continue
+        candidates.append(ln_s)
+
+    if not candidates:
+        return sanitize_name(lines[0]) if lines else ""
+
+    # score candidates: prefer short, alphabetic, contains 'fund' or uppercase name
+    def score(ln: str) -> int:
+        words = ln.split()
+        wlen = len(words)
+        digits = sum(ch.isdigit() for ch in ln)
+        digit_penalty = 10 if digits > 0 else 0
+        noise_penalty = 5 if is_noise(ln) else 0
+        fund_bonus = -3 if 'fund' in ln.lower() else 0
+        uppercase_bonus = -1 if ln == ln.upper() and 2 <= wlen <= 8 else 0
+        return wlen * 2 + digit_penalty + noise_penalty + fund_bonus + uppercase_bonus
+
+    best = min(candidates, key=lambda x: score(x))
+    best = sanitize_name(best)
+    # ensure result is not an overly long paragraph; if so, pick shortest candidate
+    if len(best.split()) > 12:
+        shortest = min(candidates, key=lambda x: len(x.split()))
+        best = sanitize_name(shortest)
+
+    return best
+                cand = lines[j]
+                if cand and not ('portfolio' in cand.lower()) and len(cand.split()) <= 12:
+                    return sanitize_name(cand)
+
+    # prefer a line that contains 'FUND' and is reasonably short
+    for line in lines:
+        if 'fund' in line.lower() and len(line.split()) <= 12:
+            return sanitize_name(line)
+
+    # prefer an uppercase-ish short line (company name often uppercase)
+    for line in lines:
+        if line == line.upper() and 2 <= len(line.split()) <= 10:
+            return sanitize_name(line)
+
+    # fallback: first non-noise line that is not too long
+    for line in lines:
+        if not is_noise_line(line) and len(line.split()) <= 12:
+            return sanitize_name(line)
+
+    # last resort: return first line sanitized
+    return sanitize_name(lines[0]) if lines else ""
 
 
 def get_foreign_unit_price(row_json, transaction_type):
@@ -955,6 +1122,10 @@ def get_position_amount(row_json, position_type):
             amount = row_json["By investment category"][-4]
 
         amount = amount.replace(" ", "")
+        # Use Decimal-aware parser to respect comma/dot decimal separators
+        parsed = _parse_signed_number_string(amount)
+        if parsed != "":
+            return parsed
         try:
             return Decimal(amount) if amount else ""
         except Exception:
@@ -1070,31 +1241,33 @@ def get_liquidity_amount(row_json):
     amount = ""
     if len(row_json.get("By investment category", [])) == 1:
         try:
-            amount = row_json["Description"][0].lower().split("ubs")[0].strip()
-            amount = amount.replace(" ", "")
-            try:
-                amount = Decimal(amount)
-            except Exception:
-                amount = ""
-        except:
+            raw = row_json["Description"][0].lower().split("ubs")[0].strip()
+            parsed = _parse_signed_number_string(raw)
+            if parsed == "":
+                try:
+                    parsed = Decimal(raw.replace(" ", "").replace(',', ''))
+                except Exception:
+                    parsed = ""
+            amount = parsed
+        except Exception:
             amount = ""
     elif len(row_json.get("By investment category", [])) == 2:
         amount_str = row_json["By investment category"][-1]
-        try:
+        parsed = _parse_signed_number_string(amount_str)
+        if parsed == "":
             try:
-                amount = Decimal(amount_str.replace(" ", ""))
+                parsed = Decimal(amount_str.replace(" ", "").replace(',', ''))
             except Exception:
-                amount = Decimal(amount_str.replace(" ", "").replace(',', ''))
-        except:
+                parsed = ""
+        if parsed == "":
             try:
-                amount = row_json["Description"][0].lower().split("ubs")[0].strip()
-                amount = amount.replace(" ", "")
-                try:
-                    amount = Decimal(amount)
-                except Exception:
-                    amount = Decimal(amount.replace(',', ''))
-            except:
-                amount = ''
+                raw = row_json["Description"][0].lower().split("ubs")[0].strip()
+                parsed = _parse_signed_number_string(raw)
+                if parsed == "":
+                    parsed = Decimal(raw.replace(" ", "").replace(',', ''))
+            except Exception:
+                parsed = ''
+        amount = parsed
     return amount
 
 

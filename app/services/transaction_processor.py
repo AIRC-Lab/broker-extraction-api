@@ -57,6 +57,9 @@ class TransactionProcessor:
         trade_information = []
         fx_tf_information = []
         other_information = []
+        # When a section header is encountered, skip that header row
+        # but allow the very next row (first data row) to be processed.
+        skip_next_header = False
 
         for row in row_list:
             try:
@@ -64,9 +67,13 @@ class TransactionProcessor:
                 if not row["text"]:
                     continue
 
-                # Skip obvious headers
+                # If this row looks like a section header, skip it
+                # and allow the following row to pass through.
                 if is_header(row["text"]):
+                    skip_next_header = True
                     continue
+                if skip_next_header:
+                    skip_next_header = False
 
                 row_json = {}
 
@@ -87,8 +94,7 @@ class TransactionProcessor:
                         ocr_box_of_current_row,
                         min_overlap_ratio=0.2,
                         center_within=False,
-                        below_header_only=True,   # ✅ CRITICAL FIX
-                        y_gap_tol=2.0
+                        below_header_only=True,
                     )
                     row_json[col_name] = [ocr_text_of_current_row[i] for i in aligned_indices]
 

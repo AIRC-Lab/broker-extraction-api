@@ -55,15 +55,24 @@ def process_pdf_task(self, pdf_path: str):
 
         extracted_data_list = {"position": [], "transaction": {"trade": [], "fx_tf": [], "other": []}}
 
-        # Extract per-PDF metadata (client name, portfolio no.) from first page OCR
+        # Extract per-PDF metadata from the first page as a starting guess.
         try:
             if page_images:
                 first_ocr = pdf_processor.perform_ocr(page_images[0])
                 full_text = " ".join(first_ocr[0].get("rec_texts", [])) if first_ocr and first_ocr[0] else ""
                 client_name = get_client_name_from_text(full_text)
                 portfolio_no = get_portfolio_no_from_text(full_text)
+                valuation_date = ""
+                # try to extract valuation date from header as well (if helper available)
+                try:
+                    from app.utils import get_valuation_date_from_text
+                    valuation_date = get_valuation_date_from_text(full_text)
+                except Exception:
+                    valuation_date = ""
+
                 pdf_processor.transaction_processor.client_name = client_name
                 pdf_processor.postion_processor.portfolio_no = portfolio_no
+                pdf_processor.postion_processor.valuation_date = valuation_date
         except Exception:
             pass
 
@@ -75,6 +84,26 @@ def process_pdf_task(self, pdf_path: str):
 
             # 2. Perform OCR ONCE
             ocr_result = pdf_processor.perform_ocr(image)
+
+            # Update per-page metadata (some PDFs repeat header on every page)
+            try:
+                page_text = " ".join(ocr_result[0].get("rec_texts", [])) if ocr_result and ocr_result[0] else ""
+                client_name = get_client_name_from_text(page_text)
+                portfolio_no = get_portfolio_no_from_text(page_text)
+                # set on processors (override previous)
+                if client_name:
+                    pdf_processor.transaction_processor.client_name = client_name
+                if portfolio_no:
+                    pdf_processor.postion_processor.portfolio_no = portfolio_no
+                try:
+                    from app.utils import get_valuation_date_from_text
+                    valuation_date = get_valuation_date_from_text(page_text)
+                    if valuation_date:
+                        pdf_processor.postion_processor.valuation_date = valuation_date
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
             # 3. Classify based on OCR text (NO extra OCR call)
             page_type = pdf_processor.classify_page(ocr_result)
