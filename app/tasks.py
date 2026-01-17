@@ -5,7 +5,7 @@ import shutil
 
 from app.services.pdf_processor import pdf_processor
 from app.services.excel_exporter import excel_exporter
-from app.utils import get_client_name_from_text, get_portfolio_no_from_text
+from app.utils import get_client_name_from_text, get_portfolio_no_from_text, get_valuation_date_from_text
 
 # Initialize Celery app
 celery_app = Celery(
@@ -23,12 +23,10 @@ def _ensure_clean_task_output_dir(task_id: str) -> str:
     We remove old artifacts (xlsx/json/png/txt etc.) to guarantee
     the API lists only the 4 Excel files produced by the main pipeline.
     """
-    # Prefer project-root relative "outputs" to match API OUTPUT_DIR="./outputs"
     base_dir = "outputs"
     out_dir = os.path.join(base_dir, task_id)
 
     if os.path.isdir(out_dir):
-        # Remove existing folder to avoid stale files being downloaded
         shutil.rmtree(out_dir, ignore_errors=True)
 
     os.makedirs(out_dir, exist_ok=True)
@@ -55,15 +53,22 @@ def process_pdf_task(self, pdf_path: str):
 
         extracted_data_list = {"position": [], "transaction": {"trade": [], "fx_tf": [], "other": []}}
 
-        # Extract per-PDF metadata (client name, portfolio no.) from first page OCR
+        # Extract per-PDF metadata (client name, portfolio no., valuation date) from first page OCR
         try:
             if page_images:
                 first_ocr = pdf_processor.perform_ocr(page_images[0])
                 full_text = " ".join(first_ocr[0].get("rec_texts", [])) if first_ocr and first_ocr[0] else ""
+
                 client_name = get_client_name_from_text(full_text)
                 portfolio_no = get_portfolio_no_from_text(full_text)
+
+                # ✅ NEW: set valuation_date so PositionProcessor won't crash & can fill the column
+                valuation_date = get_valuation_date_from_text(full_text)
+
                 pdf_processor.transaction_processor.client_name = client_name
                 pdf_processor.postion_processor.portfolio_no = portfolio_no
+                pdf_processor.postion_processor.valuation_date = valuation_date
+
         except Exception:
             pass
 
@@ -94,7 +99,6 @@ def process_pdf_task(self, pdf_path: str):
                     extracted_data_list["transaction"]["fx_tf"].extend(extracted_info.get("fx_tf_info", []))
                     extracted_data_list["transaction"]["other"].extend(extracted_info.get("other_info", []))
             else:
-                # ignore "other" pages
                 continue
 
         # 5. Export data to Excel (ONLY 4 files)
@@ -103,7 +107,6 @@ def process_pdf_task(self, pdf_path: str):
         task_id = self.request.id if hasattr(self, "request") else "unknown_task"
         output_dir = _ensure_clean_task_output_dir(task_id)
 
-        # Export outputs to outputs/<task_id>/*.xlsx
         excel_exporter.export_to_excel(extracted_data_list, output_dir)
 
         self.update_state(

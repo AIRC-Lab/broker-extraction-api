@@ -14,6 +14,9 @@ class PositionProcessor:
         self.position_type = None
         self.portfolio_no = None
 
+        # ✅ FIX: was missing -> caused AttributeError -> skipped ALL rows
+        self.valuation_date = ""
+
     def process(
         self,
         yolo_model: Any,
@@ -28,6 +31,32 @@ class PositionProcessor:
         ocr_box = ocr_result[0]["rec_boxes"]
         ocr_text = ocr_result[0]["rec_texts"]
 
+        # ---------------------------------------------------------
+        # ✅ PRE-COMPUTE HEADER INDEX + HEADER BOX PER COLUMN
+        # to make column matching stable even if OCR is slightly different
+        # ---------------------------------------------------------
+        header_idx_map = {}
+        header_box_map = {}
+
+        for col_name in position_columns:
+            idx_header = get_index_by_name(col_name, ocr_text)
+            header_idx_map[col_name] = idx_header
+            if idx_header is not None:
+                header_box_map[col_name] = ocr_box[idx_header]
+            else:
+                header_box_map[col_name] = None
+
+        # Liquidity table headers
+        header_idx_map_liq = {}
+        header_box_map_liq = {}
+        for col_name in liquidity_account_columns:
+            idx_header = get_index_by_name(col_name, ocr_text)
+            header_idx_map_liq[col_name] = idx_header
+            if idx_header is not None:
+                header_box_map_liq[col_name] = ocr_box[idx_header]
+            else:
+                header_box_map_liq[col_name] = None
+
         row_list = []
         extracted_position_data = []
 
@@ -41,7 +70,10 @@ class PositionProcessor:
         for row in row_list:
             try:
                 row_excel = {}
-                row["text"] = [e.strip() for e in row["text"]]
+                row["text"] = [e.strip() for e in row["text"] if isinstance(e, str)]
+
+                if not row["text"]:
+                    continue
 
                 if is_header(row["text"]):
                     if skip_is_header_once:
@@ -77,12 +109,13 @@ class PositionProcessor:
                     row_json = {}
 
                     for col_name in liquidity_account_columns:
-                        idx_header = get_index_by_name(col_name, ocr_text)
-                        if idx_header is None:
+                        idx_header = header_idx_map_liq.get(col_name)
+                        col_name_box = header_box_map_liq.get(col_name)
+
+                        if idx_header is None or col_name_box is None:
                             row_json[col_name] = []
                             continue
 
-                        col_name_box = ocr_box[idx_header]
                         ocr_box_of_current_row = [ocr_box[i] for i in row["index"]]
                         ocr_text_of_current_row = [ocr_text[i] for i in row["index"]]
 
@@ -114,25 +147,24 @@ class PositionProcessor:
                     row_excel["Currency"] = currency
                     row_excel["Quantity/ Amount"] = amount
                     row_excel["Security ID"] = ""
+
                     # Derive a security name from Description for liquidity accounts.
                     desc_lines = row_json.get("Description", [])
                     security_name = ""
                     if desc_lines:
-                        # If last line looks like an account number or date, prefer the earlier lines as name
                         last = desc_lines[-1].strip()
-                        last_low = last.lower()
                         looks_like_account_or_date = False
                         if is_account_no_like(last):
                             looks_like_account_or_date = True
                         if re.search(r"\b\d{1,2}[\./-]\d{1,2}[\./-]\d{2,4}\b", last):
                             looks_like_account_or_date = True
+
                         if looks_like_account_or_date and len(desc_lines) >= 2:
                             candidate_lines = desc_lines[:-1]
                         else:
                             candidate_lines = desc_lines
 
                         joined = " ".join([re.sub(r"\s+", " ", l).strip() for l in candidate_lines if l])
-                        # remove embedded account numbers and trailing dates
                         joined = re.sub(r"\b\d{3}-\d{6}(?:-[\dA-Z]+)?\b", "", joined)
                         joined = re.sub(r"\b(as of|as at|dated)\b.*", "", joined, flags=re.IGNORECASE)
                         joined = re.sub(r"\b\d{1,2}[\./-]\d{1,2}[\./-]\d{2,4}\b", "", joined)
@@ -155,12 +187,13 @@ class PositionProcessor:
                     row_json = {}
 
                     for col_name in position_columns:
-                        idx_header = get_index_by_name(col_name, ocr_text)
-                        if idx_header is None:
+                        idx_header = header_idx_map.get(col_name)
+                        col_name_box = header_box_map.get(col_name)
+
+                        if idx_header is None or col_name_box is None:
                             row_json[col_name] = []
                             continue
 
-                        col_name_box = ocr_box[idx_header]
                         ocr_box_of_current_row = [ocr_box[i] for i in row["index"]]
                         ocr_text_of_current_row = [ocr_text[i] for i in row["index"]]
 
@@ -191,9 +224,6 @@ class PositionProcessor:
 
                     security_name = re.sub(r"\s+", " ", (security_name or "")).strip()
 
-                    # cleanup security name: remove stray parentheses and closing paren characters
-                    # strip leading quantity-like tokens (digits, spaces, commas, dots, O/0)
-                    # and drop header-like short uppercase tokens
                     if security_name:
                         security_name = security_name.strip()
                         security_name = re.sub(r"^[\(\)\s]+|[\(\)\s]+$", "", security_name)

@@ -195,13 +195,137 @@ def is_header(row):
     return False
 
 
+# ==========================================================
+# ✅ FIX: tolerant header matching (case-insensitive, ignore punctuation)
+# Only change needed to "restore missing position info" without breaking others.
+# ==========================================================
+
+def _norm_header_text(s: str) -> str:
+    """
+    Normalize OCR header text:
+    - lower case
+    - remove punctuation/symbols
+    - keep alnum + space
+    - collapse spaces
+    """
+    if s is None:
+        return ""
+    s = str(s).lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)   # remove .,;:/()- etc
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _header_aliases(name: str) -> List[str]:
+    """
+    Small alias list for common OCR variations (mainly position headers).
+    Keep it minimal to avoid affecting other files.
+    """
+    n = _norm_header_text(name)
+
+    aliases = [n]
+    # Common truncations / OCR mistakes (position)
+    if n == "market value":
+        aliases += ["market valu", "market val", "mkt value", "mkt val"]
+    if n == "market price":
+        aliases += ["market pric", "mkt price", "mkt pric"]
+    if n == "cost price":
+        aliases += ["cost pric", "purchase price", "purchase pric"]
+    if n == "by investment category":
+        aliases += ["investment category", "by investment", "investment cat", "inv category"]
+    if n == "description":
+        aliases += ["descr", "descript", "security name", "security", "security name description"]
+    if n == "duration":
+        aliases += ["duratio", "durat", "maturity", "tenor"]
+
+    # Transaction headers (keep light)
+    if n == "booking text":
+        aliases += ["booking", "booking tex", "booking txt"]
+    if n == "custody account":
+        aliases += ["custody", "account", "custody acc", "custody acct"]
+
+    # remove duplicates
+    out = []
+    seen = set()
+    for a in aliases:
+        a = _norm_header_text(a)
+        if not a or a in seen:
+            continue
+        seen.add(a)
+        out.append(a)
+    return out
+
+
 def get_index_by_name(name, texts):
+    """
+    Find header index in OCR texts robustly:
+    1) exact match (old behavior)
+    2) substring match (old behavior)
+    3) tolerant match: ignore punctuation + case-insensitive + alias + token overlap
+    """
+    if not texts:
+        return None
+
+    # 1) exact match (keep old behavior)
     if name in texts:
         return texts.index(name)
+
+    # 2) substring match (keep old behavior)
     for idx, col_name in enumerate(texts):
-        if name in col_name:
-            return idx
-    return None
+        try:
+            if col_name and name in col_name:
+                return idx
+        except Exception:
+            continue
+
+    # 3) tolerant match
+    name_aliases = _header_aliases(name)
+    if not name_aliases:
+        return None
+
+    # Build normalized list once
+    norm_texts = []
+    for t in texts:
+        norm_texts.append(_norm_header_text(t))
+
+    best_idx = None
+    best_score = -1
+
+    for idx, tnorm in enumerate(norm_texts):
+        if not tnorm:
+            continue
+
+        # Prefer exact normalized / substring for any alias
+        for alias in name_aliases:
+            if not alias:
+                continue
+            if alias == tnorm:
+                return idx
+            if alias in tnorm or tnorm in alias:
+                # substring match score by length overlap
+                score = min(len(alias), len(tnorm))
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+
+        # Token overlap fallback:
+        # require at least 2 tokens overlap when possible, else 1 for single-word headers
+        t_tokens = set(tnorm.split())
+        for alias in name_aliases:
+            a_tokens = set(alias.split())
+            if not a_tokens or not t_tokens:
+                continue
+            inter = len(a_tokens & t_tokens)
+            if len(a_tokens) >= 2:
+                if inter >= 2 and inter > best_score:
+                    best_score = inter
+                    best_idx = idx
+            else:
+                if inter >= 1 and inter > best_score:
+                    best_score = inter
+                    best_idx = idx
+
+    return best_idx
 
 
 def get_transaction_type(row_json):
