@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Tuple, Union
 from datetime import datetime
 import re
 from decimal import Decimal, InvalidOperation
@@ -550,109 +550,126 @@ def get_portfolio_no_from_text(text: str):
     return nums[0] if nums else ""
 
 
-def get_client_name_from_text(text: str):
+# ==========================================================
+# ✅ CLIENT NAME (FIXED): basic rule exactly as you said
+#   Between "Portfolio number <...>" and "Statement of assets ..."
+#   Works even when OCR is token list (rec_texts) with no newlines.
+# ==========================================================
+def get_client_name_from_text(text: Union[str, List[str]]):
     """
-    Heuristic client name extraction from page header text.
-    Prefer the line immediately after a 'Portfolio number' occurrence (common layout).
-    Otherwise prefer a line containing 'FUND' (case-insensitive), then an uppercase short line.
+    BASIC RULE (yours):
+      - Find "Portfolio number"
+      - Find portfolio number token like 546-880515-01 after it
+      - Client name = all tokens AFTER portfolio number and BEFORE "Statement of assets"
+      - No heuristic scoring, no guessing.
     """
-    if not text:
+
+    # 1) Normalize input to tokens list (best for Paddle rec_texts)
+    if text is None:
         return ""
 
-    # normalize whitespace
-    text_norm = re.sub(r"\s+", " ", text or "").strip()
-    # split into lines when available; if text is a single long line (from tasks.py),
-    # also create candidate fragments by splitting on common separators.
-    raw_lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
-    if len(raw_lines) <= 1:
-        # create fragments from the single long line
-        frags = re.split(r"\s{2,}|\s-\s|\s\|\s|\s:\s|\s/\s|\s—\s|\s–\s", text_norm)
-        lines = [f.strip() for f in frags if f.strip()]
-        # ensure we also keep the original long line as fallback
-        if text_norm and text_norm not in lines:
-            lines.insert(0, text_norm)
+    if isinstance(text, list):
+        tokens = []
+        for t in text:
+            if t is None:
+                continue
+            s = str(t).strip()
+            if not s:
+                continue
+            s = re.sub(r"\s+", " ", s).strip()
+            tokens.append(s)
+        flat = " ".join(tokens)
     else:
-        lines = [re.sub(r"\s+", " ", l).strip() for l in raw_lines if l.strip()]
-
-    def sanitize_name(ln: str) -> str:
-        s = ln.strip()
-        s = re.sub(r'page\s*\d+\s*(of\s*\d+)?', '', s, flags=re.IGNORECASE).strip()
-        s = re.sub(r"\b(as of|as at|dated)\b.*", "", s, flags=re.IGNORECASE).strip()
-        s = re.sub(r"\b\d{3}-\d{6}(?:-[\dA-Z]+)?\b", "", s)
-        s = s.strip(' -:\u2014')
+        s = str(text)
+        s = s.replace("\n", " ")
         s = re.sub(r"\s+", " ", s).strip()
-        return s
+        flat = s
+        # Tokenize by spaces for fallback
+        tokens = [x for x in flat.split(" ") if x]
 
-    def is_noise(ln: str) -> bool:
-        if not ln:
-            return True
-        low = ln.lower()
-        noise = [
-            'statement', 'portfolio', 'valuation', 'valued', 'page', 'of', 'accounts',
-            'detailed positions', 'transaction list', 'by investment category', 'liquidity',
-            'last purchase', 'statement of assets', 'report', 'dated', 'as of'
-        ]
-        for t in noise:
-            if t in low:
-                return True
-        # very long lines with many digits are likely header block
-        if any(ch.isdigit() for ch in ln) and len(ln.split()) > 10:
-            return True
-        return False
+    if not tokens:
+        return ""
 
-    # gather candidate lines (single lines, not too long)
-    candidates = []
-    for ln in lines:
-        ln_s = ln.strip()
-        if not ln_s:
-            continue
-        # ignore purely numeric or account-like lines
-        if is_account_no_like(ln_s) or re.fullmatch(r"[\d\s\-\./]+", ln_s):
-            continue
-        candidates.append(ln_s)
+    # Helper: case-insensitive compare
+    def low(t: str) -> str:
+        return (t or "").lower().strip()
 
-    # If tasks.py provided a flattened full_text, try targeted extraction around 'portfolio'
-    low_text = text_norm.lower()
-    if 'portfolio' in low_text and (not candidates or len(candidates) == 1 and len(candidates[0].split()) > 10):
-        # look for 'portfolio' and take preceding fragment as candidate
-        m = re.search(r"(.{0,200})\bportfolio\b", low_text)
+    # 2) Find "portfolio number" index in tokens (tolerant)
+    port_idx = None
+    for i in range(len(tokens)):
+        if low(tokens[i]) == "portfolio" and i + 1 < len(tokens) and low(tokens[i + 1]) in ("number", "no", "no."):
+            port_idx = i
+            break
+        # Sometimes OCR returns "Portfolio number" in one token
+        if "portfolio" in low(tokens[i]) and ("number" in low(tokens[i]) or "no" == low(tokens[i])):
+            port_idx = i
+            break
+
+    if port_idx is None:
+        # If tokens fail, try regex on flat text
+        m = re.search(r"portfolio\s+(?:number|no\.?)\s+(\d{3}-\d{6}-\d{2})\s+(.*?)\s+statement\s+of\s+assets",
+                      flat, flags=re.IGNORECASE)
         if m:
-            before = text_norm[:m.start(0)].strip()
-            parts = re.split(r"\s{2,}|\s-\s|\s\|\s|\s:\s", before)
-            for p in reversed(parts):
-                p = p.strip()
-                if not p:
-                    continue
-                if any(ch.isdigit() for ch in p) and len(p.split()) > 6:
-                    continue
-                if is_account_no_like(p):
-                    continue
-                candidates.insert(0, p)
+            name = (m.group(2) or "").strip()
+            name = re.sub(r"\s+", " ", name).strip()
+            return name
+        return ""
+
+    # 3) Find portfolio number token after "portfolio number"
+    portfolio_no = None
+    portfolio_pos = None
+    # Search forward a bit
+    for j in range(port_idx, min(port_idx + 20, len(tokens))):
+        m = re.search(r"\b\d{3}-\d{6}-\d{2}\b", tokens[j])
+        if m:
+            portfolio_no = m.group(0)
+            portfolio_pos = j
+            break
+
+    if portfolio_no is None or portfolio_pos is None:
+        # fallback regex on flat
+        m = re.search(r"portfolio\s+(?:number|no\.?)\s+(\d{3}-\d{6}-\d{2})\s+(.*?)\s+statement\s+of\s+assets",
+                      flat, flags=re.IGNORECASE)
+        if m:
+            name = (m.group(2) or "").strip()
+            name = re.sub(r"\s+", " ", name).strip()
+            return name
+        return ""
+
+    # 4) Find "statement of assets" index after portfolio number
+    stmt_idx = None
+    for k in range(portfolio_pos + 1, len(tokens)):
+        # token-by-token match
+        if low(tokens[k]) == "statement":
+            # try lookahead "of assets"
+            if k + 2 < len(tokens) and low(tokens[k + 1]) == "of" and low(tokens[k + 2]) == "assets":
+                stmt_idx = k
                 break
+        # sometimes OCR combines
+        if "statement" in low(tokens[k]) and "assets" in low(tokens[k]):
+            stmt_idx = k
+            break
 
-    if not candidates:
-        return sanitize_name(lines[0]) if lines else ""
+    if stmt_idx is None:
+        # fallback regex: everything after portfolio and before statement (flat)
+        m = re.search(r"portfolio\s+(?:number|no\.?)\s+\d{3}-\d{6}-\d{2}\s+(.*?)\s+statement\s+of\s+assets",
+                      flat, flags=re.IGNORECASE)
+        if m:
+            name = (m.group(1) or "").strip()
+            name = re.sub(r"\s+", " ", name).strip()
+            return name
+        return ""
 
-    # score candidates: prefer short, alphabetic, contains 'fund' or uppercase name
-    def score(ln: str) -> int:
-        words = ln.split()
-        wlen = len(words)
-        digits = sum(ch.isdigit() for ch in ln)
-        digit_penalty = 10 if digits > 0 else 0
-        noise_penalty = 5 if is_noise(ln) else 0
-        fund_bonus = -3 if 'fund' in ln.lower() else 0
-        uppercase_bonus = -1 if ln == ln.upper() and 2 <= wlen <= 8 else 0
-        return wlen * 2 + digit_penalty + noise_penalty + fund_bonus + uppercase_bonus
+    # 5) Client name tokens are between portfolio_pos and stmt_idx
+    name_tokens = tokens[portfolio_pos + 1:stmt_idx]
+    name = " ".join(name_tokens).strip()
+    name = re.sub(r"\s+", " ", name).strip()
 
-    best = min(candidates, key=lambda x: score(x))
-    best = sanitize_name(best)
-    # ensure result is not an overly long paragraph; if so, pick shortest candidate
-    if len(best.split()) > 12:
-        shortest = min(candidates, key=lambda x: len(x.split()))
-        best = sanitize_name(shortest)
+    # Basic sanitation: remove trailing separators
+    name = name.strip(" -|:;")
 
-    return best
-    
+    # If still empty, return ""
+    return name
 
 
 def get_foreign_unit_price(row_json, transaction_type):
@@ -712,11 +729,6 @@ def _parse_signed_number_string(num_str: str):
     """
     Parse a numeric string that may contain spaces/commas and optional sign.
     Keep the sign if present.
-    Examples:
-      "408 156.10" -> 408156.10
-      "-437 212.32" -> -437212.32
-      "(437 212.32)" -> -437212.32
-      "289792000" -> 289792000
     """
     if not num_str:
         return ""
@@ -738,18 +750,16 @@ def _parse_signed_number_string(num_str: str):
     # remove parentheses for parsing
     s_no_paren = s_clean.replace("(", "").replace(")", "")
 
-    # Decide decimal separator: if both '.' and ',' present, assume the rightmost symbol is decimal separator
+    # Decide decimal separator
     dot_pos = s_no_paren.rfind('.')
     comma_pos = s_no_paren.rfind(',')
     decimal_sep = None
-    thousand_seps = [' ']
     if dot_pos != -1 and comma_pos != -1:
         if comma_pos > dot_pos:
             decimal_sep = ','
         else:
             decimal_sep = '.'
     elif comma_pos != -1 and dot_pos == -1:
-        # ambiguous: could be decimal comma or thousand separator. Heuristic: if comma followed by 3 digits, treat as thousand sep
         m = re.search(r",\d{3}(?:[^\d]|$)", s_no_paren)
         if m:
             decimal_sep = None
@@ -758,19 +768,14 @@ def _parse_signed_number_string(num_str: str):
     else:
         decimal_sep = '.'
 
-    # remove thousand separators and normalize decimal separator to dot
     normalized = s_no_paren
-    # remove spaces always
     normalized = normalized.replace(' ', '')
     if decimal_sep == ',':
-        # remove dots (thousand) if any, replace comma with dot
         normalized = normalized.replace('.', '')
         normalized = normalized.replace(',', '.')
     else:
-        # decimal is dot: remove commas
         normalized = normalized.replace(',', '')
 
-    # final cleanup: keep only digits, sign, dot
     normalized = re.sub(r"[^0-9\-\+\.]", "", normalized)
 
     try:
@@ -791,10 +796,7 @@ def _compact_lower(s: str) -> str:
 
 def _extract_ccy_amount_pairs(lines: List[str]):
     """
-    Fallback: scan all lines and collect currency-amount pairs like:
-      EUR 408156.1
-      USD -437212.32
-    Return list of tuples (CCY, amount_float)
+    Fallback: scan all lines and collect currency-amount pairs.
     """
     pairs = []
     if not lines:
@@ -807,7 +809,6 @@ def _extract_ccy_amount_pairs(lines: List[str]):
         if not t:
             continue
 
-        # find ALL occurrences in the same line (sometimes both appear)
         for m in re.finditer(r"\b([A-Z]{3})\s+([+\-]?\d[\d\s,\.()\-]*)", t):
             ccy = (m.group(1) or "").strip()
             amt_raw = (m.group(2) or "").strip()
@@ -815,7 +816,6 @@ def _extract_ccy_amount_pairs(lines: List[str]):
             if ccy and isinstance(amt, (int, float, Decimal)):
                 pairs.append((ccy, amt))
 
-    # dedupe while keeping order
     seen = set()
     out = []
     for ccy, amt in pairs:
@@ -832,17 +832,13 @@ def _extract_fx_amount_line(lines: List[str], verb: str):
     Extract (currency, amount) from a line like:
       "You bought EUR 408 156.10"
       "You sold  USD -437 212.32"
-    verb: "bought" or "sold"
     """
     if not lines:
         return "", ""
 
-    verb_key = f"you{verb}"  # compact key: "youbought" / "yousold"
-
-    # ✅ FIX: prebuild regex chunk OUTSIDE f-string expression
+    verb_key = f"you{verb}"
     verb_regex = "".join([ch + r"\s*" for ch in verb])
 
-    # 1) try find explicit verb line (OCR tolerant)
     for ln in lines:
         if not ln:
             continue
@@ -870,13 +866,11 @@ def _extract_fx_amount_line(lines: List[str], verb: str):
             amt = _parse_signed_number_string((m.group(2) or "").strip())
 
         if verb == "sold" and isinstance(amt, (int, float, Decimal)):
-            # enforce negative if OCR lost sign
             if amt > 0:
                 amt = -amt
 
         return cur, amt
 
-    # 2) fallback: scan currency/amount pairs from all lines
     pairs = _extract_ccy_amount_pairs(lines)
     if len(pairs) >= 2:
         buy_ccy, buy_amt = pairs[0]
@@ -941,7 +935,6 @@ def get_account_no_buy_sell(row_json):
     account_buy = "-".join(account_buy.split("-")[1:])
     account_sell = "-".join(account_sell.split("-")[1:])
 
-    # ✅ FIX: OCR hay nhầm '.' thành ',' trong account number
     account_buy = account_buy.replace(",", ".")
     account_sell = account_sell.replace(",", ".")
 
@@ -959,10 +952,6 @@ def is_account_no_like(s: str) -> bool:
 
 
 def split_leading_quantity_general(text: str):
-    """
-    Split leading quantity from a security line like:
-      '100 000 4.625% Medium Term Notes Toyota Motor Credit Corp.'
-    """
     if not text or not isinstance(text, str):
         return None, text
 
@@ -998,10 +987,6 @@ def split_leading_quantity_general(text: str):
 
 
 def split_leading_quantity_position(text: str):
-    """
-    Handle position Security name like:
-      '2 000 Shs Air Liquide SA (AI)'
-    """
     if not text or not isinstance(text, str):
         return None, text
 
@@ -1041,9 +1026,6 @@ def split_leading_quantity_position(text: str):
     return qty, rest
 
 
-# -----------------------------
-# robust filters for TRADE "Name/ Security"
-# -----------------------------
 def _looks_like_noise_line_for_security_name(line: str) -> bool:
     if not line:
         return True
@@ -1131,7 +1113,6 @@ def build_security_name_from_custody_account_lines(lines: List[str]) -> str:
 
     name = " ".join(cleaned_name_lines).strip()
     name = re.sub(r"\s+", " ", name).strip()
-    # remove leading quantity if present (e.g., '100 000 Foo Bar')
     try:
         qty, rest = split_leading_quantity_general(name)
         if qty is not None and rest:
@@ -1139,20 +1120,16 @@ def build_security_name_from_custody_account_lines(lines: List[str]) -> str:
     except Exception:
         pass
 
-    # remove common account tokens, trailing dates, ISIN tokens and stray punctuation
     name = re.sub(r"\bISIN\b[:\s]*[A-Z0-9\-]+", "", name, flags=re.IGNORECASE)
     name = re.sub(r"\b\d{3}-\d{6}(?:-[\dA-Z]+)?\b", "", name)
     name = re.sub(r"\b(as of|as at|dated)\b.*", "", name, flags=re.IGNORECASE)
-    name = re.sub(r"\s*\([^)]*\)\s*", " ", name)  # remove parenthesized qualifiers
+    name = re.sub(r"\s*\([^)]*\)\s*", " ", name)
     name = re.sub(r"[\)\(\"\']+", "", name)
     name = re.sub(r"\s+", " ", name).strip()
 
     return name
 
 
-# ==========================================================
-# ✅ NEW: ONLY for OTHER (UBS Call Deposit) - keep minus sign
-# ==========================================================
 def _is_negative_hint_text(s: str) -> bool:
     if not s:
         return False
@@ -1165,22 +1142,12 @@ def _is_negative_hint_text(s: str) -> bool:
 
 
 def get_foreign_gross_net_consideration_other(row_json):
-    """
-    For OTHER (UBS Call Deposit): preserve sign for amounts.
-    - Prefer reading from 'Transaction value' last cell (same as old logic)
-    - Parse signed float, keep '-' or parentheses if present
-    - If OCR lost '-', use booking_text heuristic:
-        Reduction / Repayment  -> negative
-        Interest Cap.         -> positive
-    Return: (gross, net, accrued_interest)
-    """
     booking_text = " ".join(row_json.get("Booking text", [])).strip()
     booking_text = booking_text.replace("\n", " ").strip()
     bt_low = booking_text.lower()
 
     txv = row_json.get("Transaction value", [])
 
-    # choose values similarly to old logic (but we keep sign)
     if booking_text == "Sale Spot" and len(txv) >= 3:
         gross_raw = txv[0]
         net_raw = txv[-1]
@@ -1193,12 +1160,9 @@ def get_foreign_gross_net_consideration_other(row_json):
     gross_val = _parse_signed_number_string(gross_raw)
     net_val = _parse_signed_number_string(net_raw)
 
-    # heuristic sign fix ONLY for other:
-    # reduction/repayment typically outflow -> negative
     should_be_negative = ("reduction" in bt_low) or ("repayment" in bt_low)
     should_be_positive = ("interest cap" in bt_low) or ("interest" in bt_low)
 
-    # If OCR lost sign (we detect no sign hint) and value is positive, apply heuristic
     if isinstance(gross_val, (int, float, Decimal)) and gross_val > 0:
         if should_be_negative and (not _is_negative_hint_text(gross_raw)):
             gross_val = -gross_val
@@ -1206,13 +1170,11 @@ def get_foreign_gross_net_consideration_other(row_json):
         if should_be_negative and (not _is_negative_hint_text(net_raw)):
             net_val = -net_val
 
-    # if heuristic says positive, ensure positive
     if isinstance(gross_val, (int, float, Decimal)) and gross_val < 0 and should_be_positive and (not should_be_negative):
         gross_val = abs(gross_val)
     if isinstance(net_val, (int, float, Decimal)) and net_val < 0 and should_be_positive and (not should_be_negative):
         net_val = abs(net_val)
 
-    # normalize empty
     if gross_val == "":
         gross_val = Decimal('0')
     if net_val == "":
@@ -1221,9 +1183,6 @@ def get_foreign_gross_net_consideration_other(row_json):
     return gross_val, net_val, accrued_interest
 
 
-# -----------------------------
-# Position helpers
-# -----------------------------
 def get_currency_position(row_json):
     for e in currencies:
         if e in row_json.get("By investment category", []):
@@ -1274,7 +1233,6 @@ def get_position_amount(row_json, position_type):
             amount = row_json["By investment category"][-4]
 
         amount = amount.replace(" ", "")
-        # Use Decimal-aware parser to respect comma/dot decimal separators
         parsed = _parse_signed_number_string(amount)
         if parsed != "":
             return parsed
@@ -1290,7 +1248,6 @@ def get_position_cost_price(row_json, position_type):
     try:
         texts = row_json.get("Cost price", [])
         cost_price = texts[0]
-        # find numeric token (including commas/dots/percent)
         m = re.search(r"([+\-]?[0-9\s\.,()]+%?)", cost_price)
         if not m:
             return ""
@@ -1438,7 +1395,6 @@ def get_security_name(row_json, position_type):
         else:
             candidate = desc[0].strip()
 
-    # remove leading quantity tokens (e.g., '2 000 Shs Foo')
     try:
         qty, rest = split_leading_quantity_general(candidate)
         if qty is not None and rest:
@@ -1446,7 +1402,6 @@ def get_security_name(row_json, position_type):
     except Exception:
         pass
 
-    # strip trailing account/date/ISIN tokens and parenthesis
     candidate = re.sub(r"\bISIN\b[:\s]*[A-Z0-9\-]+", "", candidate, flags=re.IGNORECASE)
     candidate = re.sub(r"\b\d{3}-\d{6}(?:-[\dA-Z]+)?\b", "", candidate)
     candidate = re.sub(r"\b(as of|as at|dated)\b.*", "", candidate, flags=re.IGNORECASE)
