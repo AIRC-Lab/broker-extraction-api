@@ -30,15 +30,10 @@ class PositionProcessor:
         if v is None:
             return ""
 
-        # If already Decimal, keep exact value (no rounding), render without scientific notation
         if isinstance(v, Decimal):
-            # Decimal('100000') -> '100000'
-            # Decimal('1234.26') -> '1234.26'
             return format(v, "f")
 
-        # If numeric primitives
         if isinstance(v, (int, float)):
-            # Avoid float artifacts by converting via string
             s = str(v).strip()
         else:
             s = str(v).strip()
@@ -46,15 +41,12 @@ class PositionProcessor:
         if not s:
             return ""
 
-        # normalize minus variants
         s = s.replace("−", "-").replace("–", "-")
 
-        # keep only likely numeric chars
         s_clean = re.sub(r"[^0-9\-\+\s,\.()]", "", s).strip()
         if not s_clean:
             return ""
 
-        # parentheses negative
         neg_by_paren = False
         if "(" in s_clean and ")" in s_clean:
             neg_by_paren = True
@@ -63,7 +55,6 @@ class PositionProcessor:
         if not s_no_paren:
             return ""
 
-        # Decide decimal separator by last occurrence heuristic (same as utils logic)
         dot_pos = s_no_paren.rfind(".")
         comma_pos = s_no_paren.rfind(",")
 
@@ -71,7 +62,6 @@ class PositionProcessor:
         if dot_pos != -1 and comma_pos != -1:
             decimal_sep = "," if comma_pos > dot_pos else "."
         elif comma_pos != -1 and dot_pos == -1:
-            # if looks like thousands grouping: 1,234 -> thousands
             if re.search(r",\d{3}(?:[^\d]|$)", s_no_paren):
                 decimal_sep = None
             else:
@@ -82,30 +72,88 @@ class PositionProcessor:
         normalized = s_no_paren.replace(" ", "")
 
         if decimal_sep == ",":
-            # dot as thousands, comma as decimal
             normalized = normalized.replace(".", "")
             normalized = normalized.replace(",", ".")
         else:
-            # comma as thousands
             normalized = normalized.replace(",", "")
 
-        # keep only sign, digits, dot
         normalized = re.sub(r"[^0-9\-\+\.]", "", normalized).strip()
         if not normalized:
             return ""
 
-        # validate by Decimal but return string
         try:
             dv = Decimal(normalized)
             if neg_by_paren and dv > 0:
                 normalized = "-" + normalized.lstrip("+").lstrip("-")
-            # IMPORTANT: do not force decimals; Decimal('100000') stays '100000'
-            # If normalized is like '100000.' (rare), clean it.
             if normalized.endswith("."):
                 normalized = normalized[:-1]
             return normalized
         except Exception:
             return ""
+
+    def _looks_like_section_header_only(self, row_text_tokens: List[str]) -> bool:
+        """
+        A row is likely a pure section header when it has no numeric/currency/ISIN content.
+        """
+        joined = " ".join(row_text_tokens or []).strip()
+        if not joined:
+            return False
+
+        joined_low = joined.lower()
+        has_currency = any(ccy.lower() in joined_low for ccy in currencies)
+        has_isin = "isin" in joined_low
+        has_percent = "%" in joined
+        has_decimal_or_longint = bool(re.search(r"\d+\.\d+", joined)) or bool(re.search(r"\d{3,}", joined))
+
+        return not (has_currency or has_isin or has_percent or has_decimal_or_longint)
+
+    def _detect_position_type_fallback(self, row_text_tokens: List[str]) -> str:
+        """
+        Fallback detection for types that OCR may truncate / vary,
+        or types that are not covered by utils.get_position_type().
+        """
+        joined = " ".join(row_text_tokens or []).strip()
+        low = joined.lower()
+
+        # ✅ Hedge funds should be treated as a Type header (not security name)
+        # Keep it strict-ish to avoid false positives.
+        if re.fullmatch(r"\s*hedge\s+funds\s*", low):
+            return "Hedge funds"
+
+        # ✅ Missing type: Liquidity - FX swap & forward contracts (OCR variations)
+        # Accept common truncations: "contrac", "contracts", etc.
+        if ("liquidity" in low) and ("fx" in low) and ("swap" in low) and ("forward" in low):
+            return "Liquidity - FX swap & forward contracts"
+
+        # ✅ Money market investments (handle OCR variations)
+        if ("liquidity" in low) and ("money" in low) and ("market" in low) and ("invest" in low):
+            return "Liquidity - Money market investments"
+
+        return ""
+
+    def _row_is_effectively_empty_position_row(
+        self,
+        *,
+        security_name: str,
+        isin: str,
+        currency: str,
+        amount_out: str,
+        cost_price_out: str,
+        market_price_out: str,
+        market_value_out: str
+    ) -> bool:
+        """
+        Remove redundant/blank rows (e.g. duplicated type line like 'Liquidity - Money market investments'
+        that shows up as an empty row).
+        """
+        def _nz(s):
+            return (str(s).strip() if s is not None else "")
+
+        if _nz(security_name) or _nz(isin) or _nz(currency):
+            return False
+        if _nz(amount_out) or _nz(cost_price_out) or _nz(market_price_out) or _nz(market_value_out):
+            return False
+        return True
 
     def process(
         self,
@@ -123,7 +171,6 @@ class PositionProcessor:
 
         # ---------------------------------------------------------
         # ✅ PRE-COMPUTE HEADER INDEX + HEADER BOX PER COLUMN
-        # to make column matching stable even if OCR is slightly different
         # ---------------------------------------------------------
         header_idx_map = {}
         header_box_map = {}
@@ -161,34 +208,37 @@ class PositionProcessor:
             try:
                 row_excel = {}
                 row["text"] = [e.strip() for e in row["text"] if isinstance(e, str)]
-
                 if not row["text"]:
                     continue
 
+                # header rows (table headers etc.)
                 if is_header(row["text"]):
                     if skip_is_header_once:
                         skip_is_header_once = False
                     else:
                         continue
 
+                # ---------------------------------------------------------
+                # ✅ TYPE DETECTION
+                # - use utils.get_position_type(row) (existing)
+                # - plus fallback for:
+                #   * Hedge funds (treat as Type header)
+                #   * Liquidity - FX swap & forward contracts (OCR variations)
+                #   * Money market investments (OCR variations)
+                # ---------------------------------------------------------
                 position_type_check = get_position_type(row)
-                if position_type_check != "":
-                    # detect if this is a pure section header (no numeric/currency content)
-                    joined = " ".join(row.get("text", [])).strip()
-                    joined_low = joined.lower()
-                    has_currency = any(ccy.lower() in joined_low for ccy in currencies)
-                    has_isin = "isin" in joined_low
-                    has_percent = "%" in joined
-                    has_decimal_or_longint = bool(re.search(r"\d+\.\d+", joined)) or bool(re.search(r"\d{3,}", joined))
+                if not position_type_check:
+                    position_type_check = self._detect_position_type_fallback(row.get("text", []))
 
-                    if not (has_currency or has_isin or has_percent or has_decimal_or_longint):
-                        # treat as header and allow next row through
+                if position_type_check != "":
+                    # detect pure section header (no numeric/currency content)
+                    if self._looks_like_section_header_only(row.get("text", [])):
                         self.position_type = position_type_check
                         skip_is_header_once = True
                         continue
-
                     self.position_type = position_type_check
 
+                # If we still have no position type, we cannot parse the row
                 if self.position_type is None:
                     continue
 
@@ -230,8 +280,6 @@ class PositionProcessor:
                     currency = get_currency_liquidity_account(row_json)
                     account_no = row_json["Description"][-1] if row_json.get("Description") else ""
                     amount = get_liquidity_amount(row_json)
-
-                    # ✅ format amount output
                     amount_out = self._format_number_output(amount)
 
                     row_excel["Portfolio No."] = self.portfolio_no or ""
@@ -241,7 +289,7 @@ class PositionProcessor:
                     row_excel["Quantity/ Amount"] = amount_out
                     row_excel["Security ID"] = ""
 
-                    # Derive a security name from Description for liquidity accounts.
+                    # Security name from Description (keep your current logic)
                     desc_lines = row_json.get("Description", [])
                     security_name = ""
                     if desc_lines:
@@ -277,6 +325,12 @@ class PositionProcessor:
                 # Normal Position tables
                 # -------------------------
                 else:
+                    # ✅ If this row is a standalone "Hedge funds" header line, do not parse as a position row.
+                    # (prevents "Hedge funds" being wrongly assigned as Security name)
+                    if self.position_type == "Hedge funds" and self._looks_like_section_header_only(row.get("text", [])):
+                        skip_is_header_once = True
+                        continue
+
                     row_json = {}
 
                     for col_name in position_columns:
@@ -327,6 +381,7 @@ class PositionProcessor:
                             pass
                         security_name = security_name.strip()
 
+                    # If amount missing, try quantity split fallback (kept)
                     try:
                         if amount == "" or amount is None:
                             extracted_qty_pos, _cleaned_name_pos = split_leading_quantity_position(security_name_raw)
@@ -339,11 +394,26 @@ class PositionProcessor:
                     market_price = get_market_price(row_json, self.position_type)
                     market_value = get_market_value(row_json, self.position_type)
 
-                    # ✅ format numeric outputs (ONLY output formatting, no logic change)
                     amount_out = self._format_number_output(amount)
                     cost_price_out = self._format_number_output(cost_price)
                     market_price_out = self._format_number_output(market_price)
                     market_value_out = self._format_number_output(market_value)
+
+                    # ---------------------------------------------------------
+                    # ✅ FIX: remove duplicated/blank "Liquidity - Money market investments" row
+                    # If the parsed row has no real data, skip it.
+                    # (also helps for any duplicated type line that leaks into table rows)
+                    # ---------------------------------------------------------
+                    if self._row_is_effectively_empty_position_row(
+                        security_name=security_name,
+                        isin=isin,
+                        currency=currency,
+                        amount_out=amount_out,
+                        cost_price_out=cost_price_out,
+                        market_price_out=market_price_out,
+                        market_value_out=market_value_out
+                    ):
+                        continue
 
                     row_excel["Portfolio No."] = self.portfolio_no or ""
                     row_excel["Type"] = self.position_type
