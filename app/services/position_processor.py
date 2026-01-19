@@ -116,12 +116,10 @@ class PositionProcessor:
         low = joined.lower()
 
         # ✅ Hedge funds should be treated as a Type header (not security name)
-        # Keep it strict-ish to avoid false positives.
         if re.fullmatch(r"\s*hedge\s+funds\s*", low):
             return "Hedge funds"
 
         # ✅ Missing type: Liquidity - FX swap & forward contracts (OCR variations)
-        # Accept common truncations: "contrac", "contracts", etc.
         if ("liquidity" in low) and ("fx" in low) and ("swap" in low) and ("forward" in low):
             return "Liquidity - FX swap & forward contracts"
 
@@ -219,26 +217,19 @@ class PositionProcessor:
                         continue
 
                 # ---------------------------------------------------------
-                # ✅ TYPE DETECTION
-                # - use utils.get_position_type(row) (existing)
-                # - plus fallback for:
-                #   * Hedge funds (treat as Type header)
-                #   * Liquidity - FX swap & forward contracts (OCR variations)
-                #   * Money market investments (OCR variations)
+                # ✅ TYPE DETECTION (safe call: prevent utils mutating row)
                 # ---------------------------------------------------------
-                position_type_check = get_position_type(row)
+                position_type_check = get_position_type({"text": list(row.get("text", []))})
                 if not position_type_check:
                     position_type_check = self._detect_position_type_fallback(row.get("text", []))
 
                 if position_type_check != "":
-                    # detect pure section header (no numeric/currency content)
                     if self._looks_like_section_header_only(row.get("text", [])):
                         self.position_type = position_type_check
                         skip_is_header_once = True
                         continue
                     self.position_type = position_type_check
 
-                # If we still have no position type, we cannot parse the row
                 if self.position_type is None:
                     continue
 
@@ -289,7 +280,6 @@ class PositionProcessor:
                     row_excel["Quantity/ Amount"] = amount_out
                     row_excel["Security ID"] = ""
 
-                    # Security name from Description (keep your current logic)
                     desc_lines = row_json.get("Description", [])
                     security_name = ""
                     if desc_lines:
@@ -326,7 +316,6 @@ class PositionProcessor:
                 # -------------------------
                 else:
                     # ✅ If this row is a standalone "Hedge funds" header line, do not parse as a position row.
-                    # (prevents "Hedge funds" being wrongly assigned as Security name)
                     if self.position_type == "Hedge funds" and self._looks_like_section_header_only(row.get("text", [])):
                         skip_is_header_once = True
                         continue
@@ -381,7 +370,6 @@ class PositionProcessor:
                             pass
                         security_name = security_name.strip()
 
-                    # If amount missing, try quantity split fallback (kept)
                     try:
                         if amount == "" or amount is None:
                             extracted_qty_pos, _cleaned_name_pos = split_leading_quantity_position(security_name_raw)
@@ -399,11 +387,6 @@ class PositionProcessor:
                     market_price_out = self._format_number_output(market_price)
                     market_value_out = self._format_number_output(market_value)
 
-                    # ---------------------------------------------------------
-                    # ✅ FIX: remove duplicated/blank "Liquidity - Money market investments" row
-                    # If the parsed row has no real data, skip it.
-                    # (also helps for any duplicated type line that leaks into table rows)
-                    # ---------------------------------------------------------
                     if self._row_is_effectively_empty_position_row(
                         security_name=security_name,
                         isin=isin,

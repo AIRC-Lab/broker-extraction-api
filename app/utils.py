@@ -584,13 +584,11 @@ def get_client_name_from_text(text: Union[str, List[str]]):
         s = s.replace("\n", " ")
         s = re.sub(r"\s+", " ", s).strip()
         flat = s
-        # Tokenize by spaces for fallback
         tokens = [x for x in flat.split(" ") if x]
 
     if not tokens:
         return ""
 
-    # Helper: case-insensitive compare
     def low(t: str) -> str:
         return (t or "").lower().strip()
 
@@ -600,15 +598,15 @@ def get_client_name_from_text(text: Union[str, List[str]]):
         if low(tokens[i]) == "portfolio" and i + 1 < len(tokens) and low(tokens[i + 1]) in ("number", "no", "no."):
             port_idx = i
             break
-        # Sometimes OCR returns "Portfolio number" in one token
         if "portfolio" in low(tokens[i]) and ("number" in low(tokens[i]) or "no" == low(tokens[i])):
             port_idx = i
             break
 
     if port_idx is None:
-        # If tokens fail, try regex on flat text
-        m = re.search(r"portfolio\s+(?:number|no\.?)\s+(\d{3}-\d{6}-\d{2})\s+(.*?)\s+statement\s+of\s+assets",
-                      flat, flags=re.IGNORECASE)
+        m = re.search(
+            r"portfolio\s+(?:number|no\.?)\s+(\d{3}-\d{6}-\d{2})\s+(.*?)\s+statement\s+of\s+assets",
+            flat, flags=re.IGNORECASE
+        )
         if m:
             name = (m.group(2) or "").strip()
             name = re.sub(r"\s+", " ", name).strip()
@@ -618,7 +616,6 @@ def get_client_name_from_text(text: Union[str, List[str]]):
     # 3) Find portfolio number token after "portfolio number"
     portfolio_no = None
     portfolio_pos = None
-    # Search forward a bit
     for j in range(port_idx, min(port_idx + 20, len(tokens))):
         m = re.search(r"\b\d{3}-\d{6}-\d{2}\b", tokens[j])
         if m:
@@ -627,9 +624,10 @@ def get_client_name_from_text(text: Union[str, List[str]]):
             break
 
     if portfolio_no is None or portfolio_pos is None:
-        # fallback regex on flat
-        m = re.search(r"portfolio\s+(?:number|no\.?)\s+(\d{3}-\d{6}-\d{2})\s+(.*?)\s+statement\s+of\s+assets",
-                      flat, flags=re.IGNORECASE)
+        m = re.search(
+            r"portfolio\s+(?:number|no\.?)\s+(\d{3}-\d{6}-\d{2})\s+(.*?)\s+statement\s+of\s+assets",
+            flat, flags=re.IGNORECASE
+        )
         if m:
             name = (m.group(2) or "").strip()
             name = re.sub(r"\s+", " ", name).strip()
@@ -639,21 +637,19 @@ def get_client_name_from_text(text: Union[str, List[str]]):
     # 4) Find "statement of assets" index after portfolio number
     stmt_idx = None
     for k in range(portfolio_pos + 1, len(tokens)):
-        # token-by-token match
         if low(tokens[k]) == "statement":
-            # try lookahead "of assets"
             if k + 2 < len(tokens) and low(tokens[k + 1]) == "of" and low(tokens[k + 2]) == "assets":
                 stmt_idx = k
                 break
-        # sometimes OCR combines
         if "statement" in low(tokens[k]) and "assets" in low(tokens[k]):
             stmt_idx = k
             break
 
     if stmt_idx is None:
-        # fallback regex: everything after portfolio and before statement (flat)
-        m = re.search(r"portfolio\s+(?:number|no\.?)\s+\d{3}-\d{6}-\d{2}\s+(.*?)\s+statement\s+of\s+assets",
-                      flat, flags=re.IGNORECASE)
+        m = re.search(
+            r"portfolio\s+(?:number|no\.?)\s+\d{3}-\d{6}-\d{2}\s+(.*?)\s+statement\s+of\s+assets",
+            flat, flags=re.IGNORECASE
+        )
         if m:
             name = (m.group(1) or "").strip()
             name = re.sub(r"\s+", " ", name).strip()
@@ -664,11 +660,7 @@ def get_client_name_from_text(text: Union[str, List[str]]):
     name_tokens = tokens[portfolio_pos + 1:stmt_idx]
     name = " ".join(name_tokens).strip()
     name = re.sub(r"\s+", " ", name).strip()
-
-    # Basic sanitation: remove trailing separators
     name = name.strip(" -|:;")
-
-    # If still empty, return ""
     return name
 
 
@@ -701,7 +693,6 @@ def get_foreign_gross_net_consideration(row_json, transaction_type):
         foreign_net_consideration = foreign_gross_consideration
         accrued_interest = ""
 
-    # parse using Decimal-aware helper to preserve precision and separators
     fg = _parse_signed_number_string(foreign_gross_consideration)
     fn = _parse_signed_number_string(foreign_net_consideration)
 
@@ -734,23 +725,18 @@ def _parse_signed_number_string(num_str: str):
         return ""
     s = str(num_str).strip()
 
-    # normalize weird minus chars if OCR returns them
     s = s.replace("−", "-").replace("–", "-")
 
-    # parentheses as negative (accounting style)
     neg_by_paren = False
     if "(" in s and ")" in s:
         neg_by_paren = True
 
-    # keep only sign, digits, dot, comma, space, parentheses
     s_clean = re.sub(r"[^0-9\-\+\s,\.()]", "", s).strip()
     if not s_clean:
         return ""
 
-    # remove parentheses for parsing
     s_no_paren = s_clean.replace("(", "").replace(")", "")
 
-    # Decide decimal separator
     dot_pos = s_no_paren.rfind('.')
     comma_pos = s_no_paren.rfind(',')
     decimal_sep = None
@@ -789,16 +775,8 @@ def _parse_signed_number_string(num_str: str):
 
 # ==========================================================
 # ✅ QUANTITY FIX (ONLY): split leading quantity from coupon% at start of name
-#   Case: "100 0003.5%ABC" -> qty=100000, name starts with "3.5%ABC"
-#   IMPORTANT: coupon belongs to NAME, not quantity.
 # ==========================================================
 def _split_qty_and_coupon_prefix(text: str):
-    """
-    If text starts with: <quantity><coupon%><rest>
-    - quantity may include spaces/commas/dots as thousand separators
-    - coupon is like 3.5% or 4% or 4,625% (OCR)
-    Return: (qty_decimal_or_None, name_rest_or_original)
-    """
     if not text or not isinstance(text, str):
         return None, text
 
@@ -806,28 +784,22 @@ def _split_qty_and_coupon_prefix(text: str):
     if not s or not s[0].isdigit():
         return None, s
 
-    # remove spaces to detect 'stuck' coupon: "100 0003.5%ABC" -> "1000003.5%ABC"
     compact = s.replace(" ", "")
 
-    # We want to detect a percent token near the start and split BEFORE it.
-    # Find earliest percent occurrence that is part of a coupon number.
     m_pct = re.search(r"(\d+(?:[.,]\d+)?)%", compact)
     if not m_pct:
         return None, s
 
-    pct_start = m_pct.start(1)  # start of coupon number
-    pct_end = m_pct.end(0)      # end including %
+    pct_start = m_pct.start(1)
+    pct_end = m_pct.end(0)
 
-    # qty_candidate is everything before the coupon number
     qty_candidate_compact = compact[:pct_start]
-    coupon_compact = compact[pct_start:pct_end]  # like "3.5%"
-    rest_compact = compact[pct_end:]             # rest of name
+    coupon_compact = compact[pct_start:pct_end]
+    rest_compact = compact[pct_end:]
 
-    # qty must be meaningful (avoid splitting when qty is too short / actually coupon itself)
     if not qty_candidate_compact or len(re.sub(r"[^\d]", "", qty_candidate_compact)) < 3:
         return None, s
 
-    # qty_candidate_compact may have stray separators from OCR; keep only digits for quantity
     qty_digits = re.sub(r"[^\d]", "", qty_candidate_compact)
     if not qty_digits:
         return None, s
@@ -837,23 +809,18 @@ def _split_qty_and_coupon_prefix(text: str):
     except Exception:
         return None, s
 
-    # rebuild name: coupon + rest (coupon belongs to name)
-    coupon_norm = coupon_compact.replace(",", ".")  # decimal dot
+    coupon_norm = coupon_compact.replace(",", ".")
     name_rest = (coupon_norm + rest_compact).strip()
     return qty_val, name_rest
 
 
 def _compact_lower(s: str) -> str:
-    """lower + remove all whitespace for OCR-tolerant matching"""
     if not s:
         return ""
     return re.sub(r"\s+", "", s.lower()).strip()
 
 
 def _extract_ccy_amount_pairs(lines: List[str]):
-    """
-    Fallback: scan all lines and collect currency-amount pairs.
-    """
     pairs = []
     if not lines:
         return pairs
@@ -884,11 +851,6 @@ def _extract_ccy_amount_pairs(lines: List[str]):
 
 
 def _extract_fx_amount_line(lines: List[str], verb: str):
-    """
-    Extract (currency, amount) from a line like:
-      "You bought EUR 408 156.10"
-      "You sold  USD -437 212.32"
-    """
     if not lines:
         return "", ""
 
@@ -953,9 +915,6 @@ def get_currency_amount_sell(row_json):
 
 
 def get_fx_forward_rate(row_json):
-    """
-    robust Rate fallback for FX Forward.
-    """
     candidates = []
     candidates.extend(row_json.get("Cost/Purchase price", []))
     candidates.extend(row_json.get("Transaction price", []))
@@ -1015,7 +974,6 @@ def split_leading_quantity_general(text: str):
     if not s or not s[0].isdigit():
         return None, s
 
-    # ✅ QUANTITY FIX (ONLY): handle "100 0003.5%ABC" stuck-coupon case
     qty_coupon, rest_after_coupon = _split_qty_and_coupon_prefix(s)
     if qty_coupon is not None:
         return qty_coupon, rest_after_coupon
@@ -1055,14 +1013,12 @@ def split_leading_quantity_position(text: str):
     if not s:
         return None, s
 
-    # ✅ If starts with percent pattern -> it's name, not quantity
     if re.match(r"^\d+(\.\d+)?\s*%", s):
         return None, s
 
     if not s[0].isdigit():
         return None, s
 
-    # ✅ QUANTITY FIX (ONLY): handle "100 0003.5%ABC" stuck-coupon case
     qty_coupon, rest_after_coupon = _split_qty_and_coupon_prefix(s)
     if qty_coupon is not None:
         return qty_coupon, rest_after_coupon
@@ -1395,26 +1351,50 @@ def get_liquidity_row_type(row_json):
     return "normal"
 
 
+# ==========================================================
+# ✅ POSITION TYPE (FIXED)
+# - Adds Hedge funds
+# - More tolerant FX swap/forward detection
+# - DOES NOT mutate row["text"]
+# ==========================================================
 def get_position_type(row):
-    row["text"] = " ".join(row["text"])
-    if "Bonds - Bond" in row["text"]:
-        return "Bonds - Bond investments"
-    elif "Equities - Equity investments" in row["text"]:
-        return "Equities - Equity investments"
-    elif "Equities - Structured products & derivatives" in row["text"]:
-        return "Equities - Structured products & derivatives"
-    elif "Liquidity - Accounts" in row['text']:
-        return "Liquidity - Accounts"
-    elif "Liquidity - Call deposits" in row["text"]:
-        return "Liquidity - Call deposits"
-    elif "market investments" in row["text"]:
-        return "Liquidity - Money market investments"
-    elif "Liquidity - Money market investments" in row["text"]:
-        return "Liquidity - Money market investments"
-    elif "Liquidity - FX swap & forward contracts" in row["text"]:
-        return "Liquidity - FX swap & forward contracts"
+    tokens = row.get("text", [])
+    if isinstance(tokens, (list, tuple)):
+        text = " ".join([str(x) for x in tokens if x is not None])
     else:
-        return ""
+        text = str(tokens)
+
+    text = re.sub(r"\s+", " ", text).strip()
+    low = text.lower()
+
+    # ✅ Hedge funds
+    if re.fullmatch(r"\s*hedge\s+funds\s*", low):
+        return "Hedge funds"
+
+    if "Bonds - Bond" in text:
+        return "Bonds - Bond investments"
+    elif "Equities - Equity investments" in text:
+        return "Equities - Equity investments"
+    elif "Equities - Structured products & derivatives" in text:
+        return "Equities - Structured products & derivatives"
+    elif "Liquidity - Accounts" in text:
+        return "Liquidity - Accounts"
+    elif "Liquidity - Call deposits" in text:
+        return "Liquidity - Call deposits"
+
+    # Money market investments (tolerant)
+    elif ("liquidity" in low and "money" in low and "market" in low and "invest" in low) or ("market investments" in low):
+        return "Liquidity - Money market investments"
+    elif "liquidity - money market investments" in low:
+        return "Liquidity - Money market investments"
+
+    # FX swap & forward contracts (tolerant)
+    elif ("liquidity" in low and "fx" in low and "swap" in low and "forward" in low):
+        return "Liquidity - FX swap & forward contracts"
+    elif "liquidity - fx swap & forward contracts" in low:
+        return "Liquidity - FX swap & forward contracts"
+
+    return ""
 
 
 def get_liquidity_amount(row_json):
@@ -1466,7 +1446,6 @@ def get_security_name(row_json, position_type):
         else:
             candidate = desc[0].strip()
 
-    # ✅ QUANTITY FIX (ONLY): avoid swallowing coupon into quantity when cleaning name
     try:
         qty, rest = split_leading_quantity_general(candidate)
         if qty is not None and rest:
