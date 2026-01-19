@@ -787,6 +787,62 @@ def _parse_signed_number_string(num_str: str):
         return ""
 
 
+# ==========================================================
+# ✅ QUANTITY FIX (ONLY): split leading quantity from coupon% at start of name
+#   Case: "100 0003.5%ABC" -> qty=100000, name starts with "3.5%ABC"
+#   IMPORTANT: coupon belongs to NAME, not quantity.
+# ==========================================================
+def _split_qty_and_coupon_prefix(text: str):
+    """
+    If text starts with: <quantity><coupon%><rest>
+    - quantity may include spaces/commas/dots as thousand separators
+    - coupon is like 3.5% or 4% or 4,625% (OCR)
+    Return: (qty_decimal_or_None, name_rest_or_original)
+    """
+    if not text or not isinstance(text, str):
+        return None, text
+
+    s = re.sub(r"\s+", " ", text).strip()
+    if not s or not s[0].isdigit():
+        return None, s
+
+    # remove spaces to detect 'stuck' coupon: "100 0003.5%ABC" -> "1000003.5%ABC"
+    compact = s.replace(" ", "")
+
+    # We want to detect a percent token near the start and split BEFORE it.
+    # Find earliest percent occurrence that is part of a coupon number.
+    m_pct = re.search(r"(\d+(?:[.,]\d+)?)%", compact)
+    if not m_pct:
+        return None, s
+
+    pct_start = m_pct.start(1)  # start of coupon number
+    pct_end = m_pct.end(0)      # end including %
+
+    # qty_candidate is everything before the coupon number
+    qty_candidate_compact = compact[:pct_start]
+    coupon_compact = compact[pct_start:pct_end]  # like "3.5%"
+    rest_compact = compact[pct_end:]             # rest of name
+
+    # qty must be meaningful (avoid splitting when qty is too short / actually coupon itself)
+    if not qty_candidate_compact or len(re.sub(r"[^\d]", "", qty_candidate_compact)) < 3:
+        return None, s
+
+    # qty_candidate_compact may have stray separators from OCR; keep only digits for quantity
+    qty_digits = re.sub(r"[^\d]", "", qty_candidate_compact)
+    if not qty_digits:
+        return None, s
+
+    try:
+        qty_val = Decimal(qty_digits)
+    except Exception:
+        return None, s
+
+    # rebuild name: coupon + rest (coupon belongs to name)
+    coupon_norm = coupon_compact.replace(",", ".")  # decimal dot
+    name_rest = (coupon_norm + rest_compact).strip()
+    return qty_val, name_rest
+
+
 def _compact_lower(s: str) -> str:
     """lower + remove all whitespace for OCR-tolerant matching"""
     if not s:
@@ -959,6 +1015,11 @@ def split_leading_quantity_general(text: str):
     if not s or not s[0].isdigit():
         return None, s
 
+    # ✅ QUANTITY FIX (ONLY): handle "100 0003.5%ABC" stuck-coupon case
+    qty_coupon, rest_after_coupon = _split_qty_and_coupon_prefix(s)
+    if qty_coupon is not None:
+        return qty_coupon, rest_after_coupon
+
     m = re.match(r"^([0-9][0-9\s,\.]*)\s+(.*)$", s)
     if not m:
         return None, s
@@ -994,11 +1055,17 @@ def split_leading_quantity_position(text: str):
     if not s:
         return None, s
 
+    # ✅ If starts with percent pattern -> it's name, not quantity
     if re.match(r"^\d+(\.\d+)?\s*%", s):
         return None, s
 
     if not s[0].isdigit():
         return None, s
+
+    # ✅ QUANTITY FIX (ONLY): handle "100 0003.5%ABC" stuck-coupon case
+    qty_coupon, rest_after_coupon = _split_qty_and_coupon_prefix(s)
+    if qty_coupon is not None:
+        return qty_coupon, rest_after_coupon
 
     m = re.match(r"^([0-9][0-9\s,\.oO]*)\s+(.*)$", s)
     if not m:
@@ -1218,6 +1285,10 @@ def is_number_strict(s: str) -> bool:
 
 
 def get_position_amount(row_json, position_type):
+    """
+    NOTE: kept structure the same; only made it more tolerant to separators
+    so Quantity/Amount does not get missed when OCR uses spaces/commas/dots.
+    """
     try:
         for idx, e in enumerate(row_json["By investment category"]):
             row_json["By investment category"][idx] = row_json["By investment category"][idx].replace(" ", "")
@@ -1395,6 +1466,7 @@ def get_security_name(row_json, position_type):
         else:
             candidate = desc[0].strip()
 
+    # ✅ QUANTITY FIX (ONLY): avoid swallowing coupon into quantity when cleaning name
     try:
         qty, rest = split_leading_quantity_general(candidate)
         if qty is not None and rest:

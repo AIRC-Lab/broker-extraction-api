@@ -4,6 +4,7 @@ from app.utils import *
 import math
 import numpy as np
 import re
+from decimal import Decimal
 
 
 class PositionProcessor:
@@ -16,6 +17,95 @@ class PositionProcessor:
 
         # ✅ FIX: was missing -> caused AttributeError -> skipped ALL rows
         self.valuation_date = ""
+
+    def _format_number_output(self, v):
+        """
+        Normalize number formatting for output:
+          - remove thousand separators (space / ',' / '.' depending on locale)
+          - decimal separator is always '.'
+          - do NOT add decimals for integers
+          - do NOT round
+        Returns string (or "" if not parseable)
+        """
+        if v is None:
+            return ""
+
+        # If already Decimal, keep exact value (no rounding), render without scientific notation
+        if isinstance(v, Decimal):
+            # Decimal('100000') -> '100000'
+            # Decimal('1234.26') -> '1234.26'
+            return format(v, "f")
+
+        # If numeric primitives
+        if isinstance(v, (int, float)):
+            # Avoid float artifacts by converting via string
+            s = str(v).strip()
+        else:
+            s = str(v).strip()
+
+        if not s:
+            return ""
+
+        # normalize minus variants
+        s = s.replace("−", "-").replace("–", "-")
+
+        # keep only likely numeric chars
+        s_clean = re.sub(r"[^0-9\-\+\s,\.()]", "", s).strip()
+        if not s_clean:
+            return ""
+
+        # parentheses negative
+        neg_by_paren = False
+        if "(" in s_clean and ")" in s_clean:
+            neg_by_paren = True
+
+        s_no_paren = s_clean.replace("(", "").replace(")", "").strip()
+        if not s_no_paren:
+            return ""
+
+        # Decide decimal separator by last occurrence heuristic (same as utils logic)
+        dot_pos = s_no_paren.rfind(".")
+        comma_pos = s_no_paren.rfind(",")
+
+        decimal_sep = None
+        if dot_pos != -1 and comma_pos != -1:
+            decimal_sep = "," if comma_pos > dot_pos else "."
+        elif comma_pos != -1 and dot_pos == -1:
+            # if looks like thousands grouping: 1,234 -> thousands
+            if re.search(r",\d{3}(?:[^\d]|$)", s_no_paren):
+                decimal_sep = None
+            else:
+                decimal_sep = ","
+        else:
+            decimal_sep = "."
+
+        normalized = s_no_paren.replace(" ", "")
+
+        if decimal_sep == ",":
+            # dot as thousands, comma as decimal
+            normalized = normalized.replace(".", "")
+            normalized = normalized.replace(",", ".")
+        else:
+            # comma as thousands
+            normalized = normalized.replace(",", "")
+
+        # keep only sign, digits, dot
+        normalized = re.sub(r"[^0-9\-\+\.]", "", normalized).strip()
+        if not normalized:
+            return ""
+
+        # validate by Decimal but return string
+        try:
+            dv = Decimal(normalized)
+            if neg_by_paren and dv > 0:
+                normalized = "-" + normalized.lstrip("+").lstrip("-")
+            # IMPORTANT: do not force decimals; Decimal('100000') stays '100000'
+            # If normalized is like '100000.' (rare), clean it.
+            if normalized.endswith("."):
+                normalized = normalized[:-1]
+            return normalized
+        except Exception:
+            return ""
 
     def process(
         self,
@@ -141,11 +231,14 @@ class PositionProcessor:
                     account_no = row_json["Description"][-1] if row_json.get("Description") else ""
                     amount = get_liquidity_amount(row_json)
 
+                    # ✅ format amount output
+                    amount_out = self._format_number_output(amount)
+
                     row_excel["Portfolio No."] = self.portfolio_no or ""
                     row_excel["Type"] = self.position_type
                     row_excel["Account No"] = account_no
                     row_excel["Currency"] = currency
-                    row_excel["Quantity/ Amount"] = amount
+                    row_excel["Quantity/ Amount"] = amount_out
                     row_excel["Security ID"] = ""
 
                     # Derive a security name from Description for liquidity accounts.
@@ -213,7 +306,6 @@ class PositionProcessor:
                     isin = get_isin_position(row_json)
 
                     amount = get_position_amount(row_json, self.position_type)
-
                     security_name_raw = get_security_name(row_json, self.position_type)
 
                     extracted_qty, cleaned_name = split_leading_quantity_general(security_name_raw)
@@ -247,16 +339,22 @@ class PositionProcessor:
                     market_price = get_market_price(row_json, self.position_type)
                     market_value = get_market_value(row_json, self.position_type)
 
+                    # ✅ format numeric outputs (ONLY output formatting, no logic change)
+                    amount_out = self._format_number_output(amount)
+                    cost_price_out = self._format_number_output(cost_price)
+                    market_price_out = self._format_number_output(market_price)
+                    market_value_out = self._format_number_output(market_value)
+
                     row_excel["Portfolio No."] = self.portfolio_no or ""
                     row_excel["Type"] = self.position_type
                     row_excel["Account No"] = ""
                     row_excel["Currency"] = currency
-                    row_excel["Quantity/ Amount"] = amount
+                    row_excel["Quantity/ Amount"] = amount_out
                     row_excel["Security ID"] = isin
                     row_excel["Security name"] = security_name
-                    row_excel["Cost price"] = cost_price
-                    row_excel["Market price"] = market_price
-                    row_excel["Market value"] = market_value
+                    row_excel["Cost price"] = cost_price_out
+                    row_excel["Market price"] = market_price_out
+                    row_excel["Market value"] = market_value_out
                     row_excel["Accrued interest"] = ""
                     row_excel["Valuation date"] = self.valuation_date or ""
 

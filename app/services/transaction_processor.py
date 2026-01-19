@@ -41,6 +41,19 @@ class TransactionProcessor:
             else:
                 header_box_map[col_name] = None
 
+        # ---------------------------------------------------------
+        # ✅ FIX (OTHER): page-level currency fallback, e.g. "Valued in SGD"
+        # Only used when row-level currency is missing.
+        # ---------------------------------------------------------
+        page_currency = ""
+        try:
+            full_page_text = " ".join([t for t in ocr_text if isinstance(t, str)])
+            m = re.search(r"\bvalued\s+in\s+([A-Z]{3})\b", full_page_text, flags=re.IGNORECASE)
+            if m:
+                page_currency = (m.group(1) or "").strip().upper()
+        except Exception:
+            page_currency = ""
+
         row_list = []
         for yolo_box in sorted_det_boxes:
             try:
@@ -111,6 +124,24 @@ class TransactionProcessor:
                     continue
 
                 row_excel = {}
+
+                # ---------------------------------------------------------
+                # ✅ FIX (OTHER): recognize Increase / New investment
+                # before calling get_transaction_type(), because your
+                # get_transaction_type() does not map these -> they got skipped.
+                # ---------------------------------------------------------
+                booking_low = booking_text_join.lower()
+
+                is_other_increase = False
+                is_other_new_investment = False
+
+                # robust contains checks (OCR variations)
+                if "increase" in booking_low:
+                    is_other_increase = True
+
+                if ("new investment" in booking_low) or ("new invest" in booking_low) or ("new inv" in booking_low):
+                    is_other_new_investment = True
+
                 transaction_type = get_transaction_type(row_json)
 
                 # =========================
@@ -194,18 +225,52 @@ class TransactionProcessor:
                     trade_information.append(row_excel)
 
                 # =========================
-                # UBS Call Deposit (OTHER)
+                # UBS Call Deposit (OTHER) + Increase + New investment
                 # =========================
-                elif transaction_type == "UBS Call Deposit":
+                elif (transaction_type == "UBS Call Deposit") or is_other_increase or is_other_new_investment:
                     isin = get_isin(row_json)
+
+                    # ---------------------------------------------------------
+                    # ✅ FIX (OTHER): currency extraction for OTHER rows
+                    # priority:
+                    #   1) get_currency(row_json)
+                    #   2) scan row text for any 3-letter currency
+                    #   3) page_currency ("Valued in XXX")
+                    # ---------------------------------------------------------
+                    row_currency = ""
+                    try:
+                        row_currency = get_currency(row_json) or ""
+                    except Exception:
+                        row_currency = ""
+
+                    if not row_currency:
+                        try:
+                            row_text_all = " ".join(row.get("text", []))
+                            # find first currency code appears in row
+                            for ccy in currencies:
+                                if re.search(rf"\b{re.escape(ccy)}\b", row_text_all):
+                                    row_currency = ccy
+                                    break
+                        except Exception:
+                            pass
+
+                    if not row_currency and page_currency:
+                        row_currency = page_currency
+
+                    # choose output transaction type for these two "other" types
+                    transaction_type_out = transaction_type
+                    if is_other_increase and transaction_type != "UBS Call Deposit":
+                        transaction_type_out = "Increase"
+                    if is_other_new_investment and transaction_type != "UBS Call Deposit":
+                        transaction_type_out = "New investment"
 
                     row_excel["Client name"] = self.client_name or ""
                     row_excel["Description"] = row_json["Booking text"][0].strip() if row_json.get("Booking text") else ""
                     row_excel["Securities ID"] = isin
-                    row_excel["Transaction type"] = transaction_type
+                    row_excel["Transaction type"] = transaction_type_out
                     row_excel["Trade date"] = trade_date
                     row_excel["Settlement date"] = settlement_date
-                    row_excel["Currency"] = ""
+                    row_excel["Currency"] = row_currency
                     row_excel["Quantity"] = ""
                     row_excel["Foreign Unit Price/ Interest rate"] = ""
 
