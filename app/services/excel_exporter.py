@@ -3,10 +3,7 @@ import pandas as pd
 
 
 class ExcelExporter:
-    # ------------------------------------------------------------
-    # Fixed schemas to avoid "missing columns" when rows are empty
-    # or when some dicts do not contain all keys.
-    # ------------------------------------------------------------
+    # Schema output cho positions
     POSITION_COLUMNS = [
         "Portfolio No.",
         "Type",
@@ -22,6 +19,7 @@ class ExcelExporter:
         "Valuation date",
     ]
 
+    # Schema output cho trade transactions
     TRADE_COLUMNS = [
         "Client name",
         "Name/ Security",
@@ -41,6 +39,7 @@ class ExcelExporter:
         "Foreign Transaction Fee",
     ]
 
+    # Schema output cho FX forward (fx_tf)
     FX_TF_COLUMNS = [
         "Client name",
         "Transaction type",
@@ -55,6 +54,7 @@ class ExcelExporter:
         "Account no. Sell",
     ]
 
+    # Schema output cho các loại OTHER transactions
     OTHER_COLUMNS = [
         "Client name",
         "Description",
@@ -75,67 +75,70 @@ class ExcelExporter:
     ]
 
     def _normalize_rows(self, rows, columns):
-        """
-        Ensure:
-        - rows is a list of dicts
-        - dataframe contains ALL expected columns in correct order
-        - missing keys become empty string
-        - extra keys are ignored (kept out of Excel to keep schema stable)
-        """
+        # Nếu None hoặc không phải list -> đưa về list rỗng
         if rows is None:
             rows = []
         if not isinstance(rows, list):
             rows = []
 
+        # Lọc chỉ nhận phần tử là dict; phần tử không phải dict bị bỏ
         safe_rows = []
         for r in rows:
             if not isinstance(r, dict):
                 continue
             safe_rows.append(r)
 
+        # Tạo DataFrame từ list dict
         df = pd.DataFrame(safe_rows)
 
-        # Add missing columns
+        # Bổ sung các cột bị thiếu trong schema
         for c in columns:
             if c not in df.columns:
                 df[c] = ""
 
-        # Keep only schema columns and order them
+        # Chỉ giữ lại các cột trong schema (bỏ key thừa)
+        # và sắp xếp theo đúng thứ tự schema
         df = df[columns]
 
-        # Replace NaN with empty string for nicer Excel output
+        # NaN -> "" để Excel không hiển thị NaN
         df = df.fillna("")
 
         return df
 
     def export_to_excel(self, data: dict, output_path: str) -> str:
         """
-        Exports extracted data to 4 Excel files:
+        Export dữ liệu extract ra 4 file Excel:
+
           - position.xlsx
           - trade.xlsx
           - fx_tf.xlsx
           - other.xlsx
 
-        Folder: outputs/<task_id>/
+        Nằm trong thư mục: outputs/<task_id>/
+
+        data kỳ vọng có cấu trúc:
+        {
+          "position": [ ... list of dict rows ... ],
+          "transaction": {
+             "trade": [ ... ],
+             "fx_tf": [ ... ],
+             "other": [ ... ]
+          }
+        }
         """
         if data is None:
             raise ValueError("No data provided for Excel export.")
 
+        # Tạo folder output nếu chưa có
         if not os.path.exists(output_path):
             os.makedirs(output_path, exist_ok=True)
 
-        # -------------------------
-        # 1) POSITION
-        # -------------------------
         position_data = data.get("position", []) or []
         df_pos = self._normalize_rows(position_data, self.POSITION_COLUMNS)
         pos_path = os.path.join(output_path, "position.xlsx")
         df_pos.to_excel(pos_path, index=False)
         print(f"[DEBUG] Exported: {pos_path}")
 
-        # -------------------------
-        # 2) TRANSACTIONS (always export 3 files)
-        # -------------------------
         transaction_data = data.get("transaction", {}) or {}
 
         # trade
@@ -162,4 +165,5 @@ class ExcelExporter:
         return output_path
 
 
+# Tạo instance dùng chung (import ở nơi khác dùng luôn)
 excel_exporter = ExcelExporter()

@@ -1,16 +1,30 @@
 from typing import List, Any
 from PIL import Image
 from app.utils import *
+from app.utils import _parse_signed_number_string
 import math
 import numpy as np
 import re
 
 
 class TransactionProcessor:
-    """A processor for extracting and refining Transactional information
-    from OCR results using a YOLO object detection model."""
+    """
+    Processor extract Transaction info (trade / fx_tf / other) từ OCR + YOLO.
+
+    Ý tưởng:
+    - YOLO detect row bands
+    - OCR tokens + boxes
+    - map token vào cột dựa header (transaction_columns)
+    - parse transaction type từ Booking text
+    - validate mạnh để tránh noise
+    - split ra 3 nhóm output:
+        + trade_info (Buy/Sell)
+        + fx_tf_info (FX Forward)
+        + other_info (Call Deposit/Increase/New investment)
+    """
 
     def __init__(self) -> None:
+        # Metadata set từ tasks.py khi tìm được trang header
         self.client_name = None
 
     def process(
@@ -19,17 +33,30 @@ class TransactionProcessor:
         image: Image.Image,
         ocr_result: List[dict]
     ) -> dict:
+        """
+        Main extraction cho transaction pages.
 
+        Output:
+        {
+          "trade_info": [...],
+          "fx_tf_info": [...],
+          "other_info": [...]
+        }
+        """
+
+        # 1) YOLO detect row boxes
         detection_result = yolo_model.predict(image)[0].boxes.xyxy.tolist()
         ceil_det_box = [[math.ceil(x) for x in yolo_box] for yolo_box in detection_result]
         sorted_det_boxes = sorted(ceil_det_box, key=lambda box: box[1])
 
+        # 2) OCR tokens + boxes
         ocr_box = ocr_result[0]["rec_boxes"]
         ocr_text = ocr_result[0]["rec_texts"]
 
         # ---------------------------------------------------------
-        # ✅ PRE-COMPUTE HEADER INDEX + HEADER BOX PER COLUMN
-        # To avoid duplicate header text and ensure consistent columns
+        # PRE-COMPUTE HEADER INDEX + HEADER BOX PER COLUMN
+        # - tránh duplicate header text
+        # - tăng ổn định mapping token->column
         # ---------------------------------------------------------
         header_idx_map = {}
         header_box_map = {}
@@ -42,8 +69,9 @@ class TransactionProcessor:
                 header_box_map[col_name] = None
 
         # ---------------------------------------------------------
-        # ✅ FIX (OTHER): page-level currency fallback, e.g. "Valued in SGD"
-        # Only used when row-level currency is missing.
+        # Page-level currency fallback:
+        # - Một số trang transaction/other chỉ nói "Valued in SGD"
+        # - Khi row không extract được currency -> dùng fallback này
         # ---------------------------------------------------------
         page_currency = ""
         try:
@@ -54,34 +82,36 @@ class TransactionProcessor:
         except Exception:
             page_currency = ""
 
+        # 3) Build row_list: mỗi YOLO row -> tokens nằm trong row
         row_list = []
         for yolo_box in sorted_det_boxes:
             try:
-                # ✅ Extend to left margin (same as PositionProcessor)
+                # extend to left margin để không miss token sát trái
                 yolo_box[0] = 0
 
-                # ✅ slightly relax threshold to avoid missing OCR boxes in row
+                # threshold 0.8: token phải nằm phần lớn bên trong row box
                 indices, _ = ocr_boxes_inside_yolo(yolo_box, ocr_box, threshold=0.8)
                 result = [ocr_text[i] for i in indices]
                 row_list.append({"text": result, "index": indices})
             except Exception:
                 continue
 
+        # Output groups
         trade_information = []
         fx_tf_information = []
         other_information = []
-        # When a section header is encountered, skip that header row
-        # but allow the very next row (first data row) to be processed.
+
+        # Cờ skip section header row
         skip_next_header = False
 
+        # 4) Parse từng row
         for row in row_list:
             try:
                 row["text"] = [e.strip() for e in row["text"] if isinstance(e, str)]
                 if not row["text"]:
                     continue
 
-                # If this row looks like a section header, skip it
-                # and allow the following row to pass through.
+                # Nếu row là header/section header -> skip
                 if is_header(row["text"]):
                     skip_next_header = True
                     continue
@@ -90,7 +120,7 @@ class TransactionProcessor:
 
                 row_json = {}
 
-                # Build row_json by aligning row boxes under each header column
+                # Map tokens trong row vào từng cột bằng header alignment
                 for col_name in transaction_columns:
                     idx_header = header_idx_map.get(col_name)
                     col_name_box = header_box_map.get(col_name)
@@ -107,17 +137,19 @@ class TransactionProcessor:
                         ocr_box_of_current_row,
                         min_overlap_ratio=0.2,
                         center_within=False,
-                        below_header_only=True,
+                        below_header_only=True,   # tránh match nhầm header trên cùng hàng
                     )
                     row_json[col_name] = [ocr_text_of_current_row[i] for i in aligned_indices]
 
                 # ---------------------------------------------------------
-                # ✅ HARD ROW VALIDATION (reduce false positives / noisy rows)
+                # HARD ROW VALIDATION:
+                # - booking text phải có
+                # - phải có trade_date hoặc settlement_date
+                # => giảm noise rows bị YOLO/OCR bắt nhầm
                 # ---------------------------------------------------------
                 booking_text_join = " ".join(row_json.get("Booking text", [])).strip()
                 trade_date, settlement_date = get_trade_settlement_date(row_json)
 
-                # If not a real transaction row, skip
                 if not booking_text_join:
                     continue
                 if not trade_date and not settlement_date:
@@ -126,16 +158,14 @@ class TransactionProcessor:
                 row_excel = {}
 
                 # ---------------------------------------------------------
-                # ✅ FIX (OTHER): recognize Increase / New investment
-                # before calling get_transaction_type(), because your
-                # get_transaction_type() does not map these -> they got skipped.
+                # FIX (OTHER): detect Increase / New investment trước,
+                # vì get_transaction_type() không map 2 case này
                 # ---------------------------------------------------------
                 booking_low = booking_text_join.lower()
 
                 is_other_increase = False
                 is_other_new_investment = False
 
-                # robust contains checks (OCR variations)
                 if "increase" in booking_low:
                     is_other_increase = True
 
@@ -145,7 +175,7 @@ class TransactionProcessor:
                 transaction_type = get_transaction_type(row_json)
 
                 # =========================
-                # Purchase / Sale → Buy / Sell
+                # CASE 1: Purchase / Sale -> Buy / Sell
                 # =========================
                 if transaction_type in ["Purchase", "Sale"]:
 
@@ -154,10 +184,11 @@ class TransactionProcessor:
                     isin = get_isin(row_json)
                     currency = get_currency(row_json)
 
+                    # Build security name từ Custody account lines
                     custody_lines = row_json.get("Custody account", [])
                     security_name_raw = build_security_name_from_custody_account_lines(custody_lines)
 
-                    # fallback if empty
+                    # fallback nếu empty: lấy 1-2 dòng đầu "hợp lý" trong custody
                     if not security_name_raw:
                         fallback_lines = []
                         for ln in custody_lines:
@@ -180,6 +211,7 @@ class TransactionProcessor:
 
                     quantity = get_quantity(row_json)
 
+                    # Nếu tên bắt đầu bằng qty -> tách qty ra và ưu tiên qty nếu thiếu
                     extracted_qty, cleaned_name = split_leading_quantity_general(security_name_raw)
                     if extracted_qty is not None:
                         security_name = re.sub(r"\s+", " ", cleaned_name).strip()
@@ -195,9 +227,10 @@ class TransactionProcessor:
                     foreign_gross_consideration, foreign_net_consideration, accrued_interest = \
                         get_foreign_gross_net_consideration(row_json, transaction_type)
 
+                    # net_consideration chỉ set khi có accrued_interest (theo logic bạn)
                     net_consideration = foreign_net_consideration if accrued_interest != "" else ""
 
-                    # ✅ more validation to avoid junk rows counted as trades
+                    # Validation để tránh junk rows bị tính là trade
                     if not isin:
                         continue
                     if quantity is None or quantity == "":
@@ -205,6 +238,7 @@ class TransactionProcessor:
                     if not account_no:
                         continue
 
+                    # Fill schema trade.xlsx
                     row_excel["Client name"] = self.client_name or ""
                     row_excel["Name/ Security"] = security_name
                     row_excel["Securities ID"] = isin
@@ -225,18 +259,15 @@ class TransactionProcessor:
                     trade_information.append(row_excel)
 
                 # =========================
-                # UBS Call Deposit (OTHER) + Increase + New investment
+                # CASE 2: UBS Call Deposit / Increase / New investment -> OTHER
                 # =========================
                 elif (transaction_type == "UBS Call Deposit") or is_other_increase or is_other_new_investment:
                     isin = get_isin(row_json)
 
-                    # ---------------------------------------------------------
-                    # ✅ FIX (OTHER): currency extraction for OTHER rows
-                    # priority:
-                    #   1) get_currency(row_json)
-                    #   2) scan row text for any 3-letter currency
-                    #   3) page_currency ("Valued in XXX")
-                    # ---------------------------------------------------------
+                    # Currency extraction cho OTHER rows:
+                    # 1) get_currency(row_json)
+                    # 2) scan row text tìm currency code
+                    # 3) fallback page_currency ("Valued in XXX")
                     row_currency = ""
                     try:
                         row_currency = get_currency(row_json) or ""
@@ -246,7 +277,6 @@ class TransactionProcessor:
                     if not row_currency:
                         try:
                             row_text_all = " ".join(row.get("text", []))
-                            # find first currency code appears in row
                             for ccy in currencies:
                                 if re.search(rf"\b{re.escape(ccy)}\b", row_text_all):
                                     row_currency = ccy
@@ -257,21 +287,52 @@ class TransactionProcessor:
                     if not row_currency and page_currency:
                         row_currency = page_currency
 
-                    # choose output transaction type for these two "other" types
+                    # set transaction type output cho Increase / New investment
                     transaction_type_out = transaction_type
                     if is_other_increase and transaction_type != "UBS Call Deposit":
                         transaction_type_out = "Increase"
                     if is_other_new_investment and transaction_type != "UBS Call Deposit":
                         transaction_type_out = "New investment"
 
+                    # Fill schema other.xlsx
                     row_excel["Client name"] = self.client_name or ""
-                    row_excel["Description"] = row_json["Booking text"][0].strip() if row_json.get("Booking text") else ""
+                    
+                    booking_text_val = row_json["Booking text"][0].strip() if row_json.get("Booking text") else ""
+
+                    if transaction_type_out == "Increase":
+                        # For Increase: Description = content of Description column, Type = Short Type
+                        desc_val = row_json.get("Description", [])
+                        desc_str = desc_val[0].strip() if desc_val else ""
+                        row_excel["Description"] = desc_str
+                        row_excel["Transaction type"] = transaction_type_out
+                    else:
+                        # For others: Description = Short Type, Type = Booking Text
+                        row_excel["Description"] = transaction_type_out
+                        row_excel["Transaction type"] = booking_text_val
+
                     row_excel["Securities ID"] = isin
-                    row_excel["Transaction type"] = transaction_type_out
                     row_excel["Trade date"] = trade_date
                     row_excel["Settlement date"] = settlement_date
                     row_excel["Currency"] = row_currency
-                    row_excel["Quantity"] = ""
+                    # Extract Quantity from "Number/Amount" and strip currency if present
+                    qty_raw_list = row_json.get("Number/Amount", [])
+                    qty_raw = qty_raw_list[0].strip() if qty_raw_list else ""
+
+                    # Strict extraction: find the first sequence that looks like a number
+                    try:
+                        # Updated regex to allow spaces as thousands separators
+                        # Matches: optional sign, digits/commas/spaces, optional decimal part
+                        match_num = re.search(r"[\-\+]?[\d, ]+(?:\.\d+)?", qty_raw)
+                        clean_qty = ""
+                        if match_num:
+                            # Parse the candidate string
+                            parsed_val = _parse_signed_number_string(match_num.group(0))
+                            if parsed_val != "":
+                                clean_qty = str(parsed_val)
+                    except Exception:
+                        clean_qty = ""
+
+                    row_excel["Quantity"] = clean_qty
                     row_excel["Foreign Unit Price/ Interest rate"] = ""
 
                     foreign_gross_consideration, foreign_net_consideration, accrued_interest = \
@@ -288,9 +349,9 @@ class TransactionProcessor:
                     other_information.append(row_excel)
 
                 # =========================
-                # FX Forward
+                # CASE 3: FX Forward / FX Spot -> fx_tf.xlsx
                 # =========================
-                elif transaction_type == "FX Forward":
+                elif transaction_type in ["FX Forward", "FX Spot"]:
                     rate = get_fx_forward_rate(row_json)
                     if rate == "":
                         continue
@@ -315,10 +376,11 @@ class TransactionProcessor:
                     fx_tf_information.append(row_excel)
 
                 else:
-                    # unknown type -> skip
+                    # Unknown type -> skip row
                     continue
 
             except Exception:
+                # Skip row lỗi
                 continue
 
         return {

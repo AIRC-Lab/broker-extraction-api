@@ -15,8 +15,6 @@ from .transaction_processor import TransactionProcessor
 
 class PDFProcessor:
     def __init__(self):
-        # Initialize PaddleOCR once to avoid repeated loading
-        # IMPORTANT: enable GPU
         self.ocr = PaddleOCR(
             text_detection_model_name="PP-OCRv5_server_det",
             text_recognition_model_name="PP-OCRv5_server_rec",
@@ -26,17 +24,13 @@ class PDFProcessor:
             use_textline_orientation=False,
         )
 
-        # YOLO will use GPU automatically if available
         self.yolo = YOLO("app/weights/yolo_broker_line_detect.pt")
 
         self.postion_processor = PositionProcessor()
         self.transaction_processor = TransactionProcessor()
 
     def pdf_to_images(self, pdf_path: str) -> list[Image.Image]:
-        """
-        Converts each page of a PDF file into a PIL Image object using pdf2image.
-        Requires poppler-utils to be installed on the system.
-        """
+        
         try:
             images = convert_from_path(pdf_path)
             print(f"[DEBUG] Converted {len(images)} pages from PDF to images.")
@@ -46,13 +40,12 @@ class PDFProcessor:
             raise
 
     def classify_page(self, ocr_result: list) -> str:
-        """
-        Classifies a page as 'position' or 'transaction' based on OCR text.
-        OCR is NOT called here (to avoid running OCR twice).
-        """
+       
         try:
             if not ocr_result or not ocr_result[0] or "rec_texts" not in ocr_result[0]:
                 return "other"
+
+            # Nối toàn bộ token OCR thành chuỗi lớn để classify bằng keyword
             full_text = " ".join(ocr_result[0]["rec_texts"])
             page_type = classify_page_type(full_text)
             print(f"[DEBUG] Classified page as: {page_type}")
@@ -62,21 +55,12 @@ class PDFProcessor:
             return "other"
 
     def perform_ocr(self, image: Image.Image) -> list:
-        """
-        Performs OCR on an image using PaddleOCR and returns the OCR result
-        in the format expected by processors:
-          ocr_result = [{
-              "rec_boxes": [...],
-              "rec_texts": [...],
-              "rec_scores": [...]
-          }]
-        """
+       
         img_array = np.array(image)
         try:
             result = self.ocr.ocr(img_array)
-            # Some PaddleOCR versions may return already in dict format;
-            # we assume your current pipeline returns list[dict].
-            # Keep as-is.
+
+            # Log số text blocks (tuỳ version paddleocr: result[0] có thể list hoặc dict)
             print(f"[DEBUG] Performed OCR. Found {len(result[0]) if result and result[0] else 0} text blocks.")
             return result
         except Exception as e:
@@ -84,10 +68,6 @@ class PDFProcessor:
             raise
 
     def extract_info(self, image: Image.Image, ocr_result: list, page_type: str):
-        """
-        Extract structured information from the OCR result based on page type.
-        Uses improved PositionProcessor / TransactionProcessor logic.
-        """
         try:
             if page_type == 'position':
                 extracted_data = self.postion_processor.process(self.yolo, image, ocr_result)
@@ -95,11 +75,14 @@ class PDFProcessor:
                 extracted_data = self.transaction_processor.process(self.yolo, image, ocr_result)
             else:
                 extracted_data = {}
+
             print(f"[DEBUG] Extracted info for {page_type} page.")
             return extracted_data
         except Exception as e:
+            # Không crash toàn pipeline nếu 1 trang lỗi
             print(f"[WARN] extract_info failed for page_type={page_type}: {e}")
             return {}
 
 
+# Instance dùng chung
 pdf_processor = PDFProcessor()

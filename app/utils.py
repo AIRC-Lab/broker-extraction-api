@@ -84,7 +84,9 @@ transaction_columns = [
     "Cost/Purchase price",
     "Transaction price",
     "Transaction gain",
-    "Transaction value"
+    "Transaction value",
+    "Description",
+    "Number/Amount"
 ]
 
 position_columns = [
@@ -194,12 +196,6 @@ def is_header(row):
 
     return False
 
-
-# ==========================================================
-# ✅ FIX: tolerant header matching (case-insensitive, ignore punctuation)
-# Only change needed to "restore missing position info" without breaking others.
-# ==========================================================
-
 def _norm_header_text(s: str) -> str:
     """
     Normalize OCR header text:
@@ -214,7 +210,6 @@ def _norm_header_text(s: str) -> str:
     s = re.sub(r"[^a-z0-9\s]", " ", s)   # remove .,;:/()- etc
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
 
 def _header_aliases(name: str) -> List[str]:
     """
@@ -257,12 +252,6 @@ def _header_aliases(name: str) -> List[str]:
 
 
 def get_index_by_name(name, texts):
-    """
-    Find header index in OCR texts robustly:
-    1) exact match (old behavior)
-    2) substring match (old behavior)
-    3) tolerant match: ignore punctuation + case-insensitive + alias + token overlap
-    """
     if not texts:
         return None
 
@@ -331,17 +320,89 @@ def get_index_by_name(name, texts):
 def get_transaction_type(row_json):
     booking_text = " ".join(row_json.get("Booking text", [])).strip()
     booking_text = booking_text.replace("\n", " ").strip()
+    
+    # Normalized for case-insensitive check
+    text_upper = booking_text.upper()
 
-    if booking_text == "Sec. receipt against payment":
-        return "Purchase"
-    elif booking_text == "Sec. delivery against payment" or booking_text == "Sale Spot":
-        return "Sale"
-    elif "FX Forward" in booking_text:
+    # Priorities: 
+    # 1. Specific phrases for Buy/Sell (Longer phrases first)
+    # 2. FX
+    # 3. Other known types
+    # 4. Fallback
+
+    # --- BUY KEYWORDS ---
+    buy_keywords = [
+        "SOLD TO YOU AS PRINCIPAL",
+        "BOUGHT FOR YOU AS AGENT",
+        "NEW ISSUE PURCHASE",
+        "YOUR PURCHASE",
+        "SEC. RECEIPT AGAINST PAYMENT",
+        "PURCHASE",
+        "BUY"
+    ]
+    
+    # --- SELL KEYWORDS ---
+    sell_keywords = [
+        "SOLD FOR YOU AS AGENT",
+        "BOUGHT FROM YOU AS PRINCIPAL",
+        "FRAMEWORK REDEMPTION", # "Redemption" might be too broad? User said "Redemption"
+        "REDEMPTION",
+        "YOUR SALE",
+        "SEC. DELIVERY AGAINST PAYMENT",
+        "SALE SPOT", # Kept from legacy, though might be FX Spot depending on context
+        "SALE",
+        "SELL"
+    ]
+
+    # Check for Buy/Sell using phrases
+    # Check distinct phrases first? Or just 'in'?
+    # User said: "chỉ cần đúng từ hoặc cụm từ đó" -> substring match is likely implied/sufficient
+    # BUT "SOLD TO YOU" vs "SOLD FOR YOU" overlap on "SOLD". 
+    # Must check longest matches first.
+
+    # Combine all and check for match?
+    # Actually, let's check specifically.
+    
+    # Check explicit long phrases first to avoid ambiguity
+    if "SOLD TO YOU AS PRINCIPAL" in text_upper: return "Purchase"
+    if "BOUGHT FOR YOU AS AGENT" in text_upper: return "Purchase"
+    if "SOLD FOR YOU AS AGENT" in text_upper: return "Sale"
+    if "BOUGHT FROM YOU AS PRINCIPAL" in text_upper: return "Sale"
+
+    # FX Types (Check before generic Buy/Sell to avoid misclassification if they contain those words?)
+    # "FX Forward" contains neither Buy/Sell usually in title. 
+    # "Sale Spot" contains "Sale". 
+    
+    if "FX FORWARD" in text_upper:
         return "FX Forward"
-    elif "Reduction" in booking_text or "Repayment" in booking_text or "Interest Cap." in booking_text:
+    
+    # "FX Spot" or "Spot" (but exclude "Sale Spot" if it's meant to be Sale?)
+    # User listed "Sale Spot" under legacy Sale? 
+    # Wait, check priority. If "Sale Spot" is Sale, it should be caught by "Sale" keyword?
+    # But previous code had "Sale Spot" -> Sale.
+    # And "FX Spot" -> FX Spot.
+    
+    if "FX SPOT" in text_upper:
+        return "FX Spot"
+    
+    # Generic Buy/Sell checks
+    for k in buy_keywords:
+        if k in text_upper:
+            return "Purchase"
+            
+    for k in sell_keywords:
+        if k in text_upper:
+            return "Sale"
+
+    # Other types
+    if "SPOT" in text_upper and "SALE" not in text_upper: 
+         # If just "Spot" (and not Sale Spot which is Sale), treat as FX Spot?
+         return "FX Spot"
+
+    if "REDUCTION" in text_upper or "REPAYMENT" in text_upper or "INTEREST CAP." in text_upper:
         return "UBS Call Deposit"
-    else:
-        return booking_text.title()
+
+    return booking_text.title()
 
 
 def get_isin(row_json):
@@ -357,9 +418,6 @@ def get_isin(row_json):
 
 
 def extract_account_numbers(text: str):
-    """
-    Extract account numbers of pattern like 546-880515.N1 or 546-880515.09T
-    """
     pattern = r"\b\d{3}-\d{6}\.[A-Z0-9]+\b"
     return re.findall(pattern, text)
 
@@ -373,13 +431,6 @@ def convert_date_format(date_str, current_format="%d.%m.%Y", desired_format="%m/
 
 
 def get_valuation_date_from_text(text: str):
-    """
-    Extract valuation date from header text. Handles patterns like:
-      - 'Statement of assets as of 31 March 2025'
-      - 'Valuation date: 31.03.2025' (dd.mm.yyyy)
-      - 'Valued as at 31.03.25'
-    Returns MM/DD/YYYY or empty string.
-    """
     if not text:
         return ""
 
@@ -549,21 +600,7 @@ def get_portfolio_no_from_text(text: str):
     nums = extract_portfolio_numbers(text)
     return nums[0] if nums else ""
 
-
-# ==========================================================
-# ✅ CLIENT NAME (FIXED): basic rule exactly as you said
-#   Between "Portfolio number <...>" and "Statement of assets ..."
-#   Works even when OCR is token list (rec_texts) with no newlines.
-# ==========================================================
 def get_client_name_from_text(text: Union[str, List[str]]):
-    """
-    BASIC RULE (yours):
-      - Find "Portfolio number"
-      - Find portfolio number token like 546-880515-01 after it
-      - Client name = all tokens AFTER portfolio number and BEFORE "Statement of assets"
-      - No heuristic scoring, no guessing.
-    """
-
     # 1) Normalize input to tokens list (best for Paddle rec_texts)
     if text is None:
         return ""
@@ -712,15 +749,7 @@ def get_foreign_gross_net_consideration(row_json, transaction_type):
 
     return fg, fn, accrued_interest
 
-
-# =========================
-# ✅ FX Forward helpers (ONLY for fx_tf)
-# =========================
 def _parse_signed_number_string(num_str: str):
-    """
-    Parse a numeric string that may contain spaces/commas and optional sign.
-    Keep the sign if present.
-    """
     if not num_str:
         return ""
     s = str(num_str).strip()
@@ -772,10 +801,6 @@ def _parse_signed_number_string(num_str: str):
     except (InvalidOperation, ValueError):
         return ""
 
-
-# ==========================================================
-# ✅ QUANTITY FIX (ONLY): split leading quantity from coupon% at start of name
-# ==========================================================
 def _split_qty_and_coupon_prefix(text: str):
     if not text or not isinstance(text, str):
         return None, text
@@ -1223,13 +1248,27 @@ def get_currency_postion(row_json):
 
 def get_isin_position(row_json):
     for e in row_json.get("Description", []):
-        if "ISIN" in e:
-            isin = e.split("ISIN")[1].split()[0].strip()
-            return isin
+        if "ISIN" in str(e).upper():
+            # Use regex to find ISIN code pattern
+            # Matches ISIN followed by optional colon/space, then captured group
+            match = re.search(r"ISIN[:\s]*([A-Z0-9]+(?:-[A-Za-z0-9]+)?)", str(e), re.IGNORECASE)
+            if match:
+                raw_isin = match.group(1).strip()
+                # Clean up: if it contains a hyphen, take only the first part if it looks like a valid ISIN (12 chars)
+                if "-" in raw_isin:
+                    parts = raw_isin.split("-")
+                    # Valid ISIN is 12 chars. If first part is 12 chars, it's likely the ISIN.
+                    if len(parts[0]) == 12:
+                        return parts[0]
+                    # Fallback logic: just return what we found but stripped?
+                    # Let's assume the part before hyphen is what we want if it looks alphanumeric
+                    return parts[0]
+                return raw_isin
     return ""
 
 
 def is_number_strict(s: str) -> bool:
+    """Check if string is a strict number (single decimal point only)"""
     s = s.strip()
     if s.count('.') > 1:
         return False
@@ -1240,34 +1279,185 @@ def is_number_strict(s: str) -> bool:
     return s.replace('.', '', 1).isdigit()
 
 
+def _is_valid_number_format(s: str) -> bool:
+    """
+    Check if string is a valid number in various formats:
+    - 1234567 (plain)
+    - 1,234,567 (US/UK thousand sep)
+    - 1.234.567 (European thousand sep)
+    - 1,234,567.89 (US/UK with decimal)
+    - 1.234.567,89 (European with decimal)
+    """
+    if not s:
+        return False
+    s = s.strip()
+    
+    # Handle negative
+    if s.startswith('-') or s.startswith('+'):
+        s = s[1:]
+    
+    # Handle parentheses for negative
+    s = s.replace('(', '').replace(')', '')
+    
+    if not s:
+        return False
+    
+    # Must have at least one digit
+    if not any(c.isdigit() for c in s):
+        return False
+    
+    # Count separators
+    dot_count = s.count('.')
+    comma_count = s.count(',')
+    
+    # Remove all separators and check if rest is digits
+    cleaned = s.replace('.', '').replace(',', '').replace(' ', '')
+    if not cleaned.isdigit():
+        return False
+    
+    # Valid patterns:
+    # - Only digits: OK
+    # - Multiple dots, no comma: European thousand sep (1.234.567)
+    # - Multiple commas, no dot: US thousand sep (1,234,567)
+    # - Multiple dots + one comma at end: European (1.234.567,89)
+    # - Multiple commas + one dot at end: US (1,234,567.89)
+    # - One dot only: decimal (1234.56)
+    # - One comma only: could be decimal (1234,56) or thousand (1,234)
+    
+    return True
+
+
+def _is_quantity_candidate(s: str) -> bool:
+    """
+    Check if a string looks like a valid quantity number.
+    Must have at least 1 digit, and not look like a percentage or coupon.
+    """
+    if not s:
+        return False
+    s = s.strip()
+    
+    # Skip if it's a percentage (like 5.25%)
+    if '%' in s:
+        return False
+    
+    # Skip if it's a currency code
+    if s.upper() in currencies:
+        return False
+    
+    # Skip known non-quantity keywords
+    low = s.lower()
+    skip_keywords = ['isin', 'subtotal', 'total', 'usd', 'eur', 'chf', 'gbp', 'jpy']
+    for kw in skip_keywords:
+        if kw in low:
+            return False
+    
+    # Must contain at least one digit
+    if not any(c.isdigit() for c in s):
+        return False
+    
+    # Check if it's a valid number format (handles European formats too)
+    return _is_valid_number_format(s)
+
+
+def _combine_adjacent_number_tokens(tokens: List[str]) -> List[Tuple[str, int]]:
+    """
+    Combine adjacent tokens that together form a number.
+    Returns list of (combined_number, start_index) tuples.
+    Preserves decimal separators.
+    """
+    results = []
+    if not tokens:
+        return results
+    
+    i = 0
+    while i < len(tokens):
+        token = tokens[i].strip()
+        
+        # Skip empty or non-digit-containing tokens
+        if not token or not any(c.isdigit() for c in token):
+            i += 1
+            continue
+        
+        # Try to combine with next tokens if they look like continuation
+        combined = token
+        j = i + 1
+        while j < len(tokens):
+            next_token = tokens[j].strip()
+            # Check if next token is purely digits or decimal part (continuation of a split number)
+            # Allow formats like: "000", "567", ",89", ".89"
+            if next_token and re.fullmatch(r'[\d,\.]{1,4}', next_token):
+                combined += next_token
+                j += 1
+            else:
+                break
+        
+        if _is_valid_number_format(combined):
+            results.append((combined, i))
+        
+        i = j if j > i + 1 else i + 1
+    
+    return results
+
+
 def get_position_amount(row_json, position_type):
     """
-    NOTE: kept structure the same; only made it more tolerant to separators
-    so Quantity/Amount does not get missed when OCR uses spaces/commas/dots.
+    Extract quantity/amount from position row.
+    Searches in 'By investment category' and 'Description' fields.
     """
     try:
-        for idx, e in enumerate(row_json["By investment category"]):
-            row_json["By investment category"][idx] = row_json["By investment category"][idx].replace(" ", "")
-
-        amount = ""
-        if len(row_json["By investment category"]) >= 1 and is_number_strict(row_json["By investment category"][-1]):
-            amount = row_json["By investment category"][-1]
-        elif len(row_json["By investment category"]) >= 2 and is_number_strict(row_json["By investment category"][-2]):
-            amount = row_json["By investment category"][-2]
-        elif len(row_json["By investment category"]) >= 3 and is_number_strict(row_json["By investment category"][-3]):
-            amount = row_json["By investment category"][-3]
-        elif len(row_json["By investment category"]) >= 4 and is_number_strict(row_json["By investment category"][-4]):
-            amount = row_json["By investment category"][-4]
-
-        amount = amount.replace(" ", "")
-        parsed = _parse_signed_number_string(amount)
-        if parsed != "":
-            return parsed
-        try:
-            return Decimal(amount) if amount else ""
-        except Exception:
-            return ""
-    except:
+        # Normalize tokens in By investment category
+        by_inv_cat = row_json.get("By investment category", [])
+        normalized_tokens = []
+        for e in by_inv_cat:
+            if e is not None:
+                # Don't strip spaces too aggressively - preserve decimal format
+                normalized_tokens.append(str(e).strip())
+        
+        # Strategy 1: Check each token from end to beginning for valid quantity
+        # Look for tokens that look like numbers (including decimals like 0.031)
+        for idx in range(len(normalized_tokens) - 1, -1, -1):
+            token = normalized_tokens[idx].replace(" ", "")
+            if _is_quantity_candidate(token):
+                parsed = _parse_signed_number_string(token)
+                if parsed != "" and isinstance(parsed, Decimal):
+                    # Accept any valid number (including decimals < 1)
+                    return parsed
+        
+        # Strategy 2: Try combining adjacent tokens (OCR may split large numbers)
+        combined_candidates = _combine_adjacent_number_tokens(normalized_tokens)
+        for combined, _ in reversed(combined_candidates):  # Prefer later (rightmost) combined numbers
+            parsed = _parse_signed_number_string(combined)
+            if parsed != "" and isinstance(parsed, Decimal):
+                return parsed
+        
+        # Strategy 3: Check Description field for leading quantity
+        desc = row_json.get("Description", [])
+        if desc:
+            first_desc = str(desc[0]).strip() if desc[0] else ""
+            if first_desc:
+                # Try to extract leading quantity from description
+                qty, _ = split_leading_quantity_position(first_desc)
+                if qty is not None:
+                    return qty
+                
+                # Also try general split
+                qty2, _ = split_leading_quantity_general(first_desc)
+                if qty2 is not None:
+                    return qty2
+        
+        # Strategy 4: Fallback - check all tokens more liberally
+        for idx in range(len(normalized_tokens) - 1, -1, -1):
+            token = normalized_tokens[idx].replace(" ", "")
+            if token and any(c.isdigit() for c in token):
+                # Skip obvious non-quantities
+                if '%' in token or token.upper() in currencies:
+                    continue
+                parsed = _parse_signed_number_string(token)
+                if parsed != "" and isinstance(parsed, Decimal):
+                    return parsed
+        
+        return ""
+    except Exception:
         return ""
 
 
@@ -1350,13 +1540,6 @@ def get_liquidity_row_type(row_json):
                 return "subtotal"
     return "normal"
 
-
-# ==========================================================
-# ✅ POSITION TYPE (FIXED)
-# - Adds Hedge funds
-# - More tolerant FX swap/forward detection
-# - DOES NOT mutate row["text"]
-# ==========================================================
 def get_position_type(row):
     tokens = row.get("text", [])
     if isinstance(tokens, (list, tuple)):
@@ -1367,9 +1550,20 @@ def get_position_type(row):
     text = re.sub(r"\s+", " ", text).strip()
     low = text.lower()
 
-    # ✅ Hedge funds
+    # Hedge funds & private markets - Hedge funds
+    if ("hedge funds" in low and "private markets" in low) or \
+       "hedge funds & private markets - hedge funds" in low or \
+       "hedge funds & private markets" in low:
+        return "Hedge funds & private markets - Hedge funds"
+
     if re.fullmatch(r"\s*hedge\s+funds\s*", low):
         return "Hedge funds"
+
+    # Others - Structured products & derivatives
+    if ("others" in low and "structured products" in low and "derivatives" in low) or \
+       "others - structured products & derivatives" in low or \
+       "others - structured products" in low:
+        return "Others - Structured products & derivatives"
 
     if "Bonds - Bond" in text:
         return "Bonds - Bond investments"
@@ -1432,20 +1626,59 @@ def get_liquidity_amount(row_json):
 
 
 def get_security_name(row_json, position_type):
+    # List of all known position types to filter out
+    known_position_types = [
+        "Hedge funds & private markets - Hedge funds",
+        "Hedge funds",
+        "Others - Structured products & derivatives",
+        "Bonds - Bond investments",
+        "Equities - Equity investments",
+        "Equities - Structured products & derivatives",
+        "Liquidity - Accounts",
+        "Liquidity - Call deposits",
+        "Liquidity - Money market investments",
+        "Liquidity - FX swap & forward contracts",
+    ]
+    
     desc = row_json.get("Description", [])
     if not desc:
         return ""
 
-    if desc[0] == "ts" or desc[0] == position_type:
-        if len(desc) > 2 and not any(char.isdigit() for char in desc[2]):
-            return desc[1] + " " + desc[2]
-        return desc[1] if len(desc) > 1 else ""
-    else:
-        if len(desc) > 1 and not any(char.isdigit() for char in desc[1]):
-            candidate = (desc[0] + " " + desc[1]).strip()
+    # Filter out position type entries from description
+    filtered_desc = []
+    for d in desc:
+        d_str = str(d).strip() if d else ""
+        if not d_str:
+            continue
+        # Check if this element is a position type
+        is_type = False
+        d_low = d_str.lower()
+        for pt in known_position_types:
+            if pt.lower() in d_low or d_low in pt.lower():
+                is_type = True
+                break
+        # Also check if it matches current position_type
+        if position_type and (position_type.lower() in d_low or d_low in position_type.lower()):
+            is_type = True
+        if not is_type:
+            filtered_desc.append(d_str)
+    
+    if not filtered_desc:
+        return ""
+    
+    # Build security name from filtered description
+    if filtered_desc[0] == "ts":
+        if len(filtered_desc) > 2 and not any(char.isdigit() for char in filtered_desc[2]):
+            candidate = filtered_desc[1] + " " + filtered_desc[2]
         else:
-            candidate = desc[0].strip()
+            candidate = filtered_desc[1] if len(filtered_desc) > 1 else ""
+    else:
+        if len(filtered_desc) > 1 and not any(char.isdigit() for char in filtered_desc[1]):
+            candidate = (filtered_desc[0] + " " + filtered_desc[1]).strip()
+        else:
+            candidate = filtered_desc[0].strip()
 
+    # Step 1: Remove leading quantity (but keep percentages attached to words)
     try:
         qty, rest = split_leading_quantity_general(candidate)
         if qty is not None and rest:
@@ -1453,11 +1686,44 @@ def get_security_name(row_json, position_type):
     except Exception:
         pass
 
+    # Step 2: Clean strange/special characters at the beginning
+    # Remove leading non-alphanumeric chars (except for % which might be part of coupon like "3.703%Notes")
+    candidate = re.sub(r'^[^\w%]+', '', candidate)
+    
+    # Step 3: Remove leading pure numbers (like "000") that are not percentages
+    # Pattern: numbers at start followed by space or end, but NOT if followed by %
+    candidate = re.sub(r'^(\d+(?:[.,]\d+)?)\s+(?!%)', '', candidate)
+    
+    # Step 4: Remove leading decimal numbers (like "0.00") not followed by %
+    candidate = re.sub(r'^(\d+\.\d+)\s+', '', candidate)
+    
+    # Step 5: Remove strange Unicode characters and brackets
+    candidate = re.sub(r'[）（【】「」『』〈〉《》〔〕]+', '', candidate)
+    
+    # Step 6: Clean up ISIN, account numbers, date phrases
     candidate = re.sub(r"\bISIN\b[:\s]*[A-Z0-9\-]+", "", candidate, flags=re.IGNORECASE)
     candidate = re.sub(r"\b\d{3}-\d{6}(?:-[\dA-Z]+)?\b", "", candidate)
     candidate = re.sub(r"\b(as of|as at|dated)\b.*", "", candidate, flags=re.IGNORECASE)
+    
+    # Step 7: Remove normal parentheses content (but keep percentage patterns)
     candidate = re.sub(r"\s*\([^)]*\)\s*", " ", candidate)
-    candidate = re.sub(r"[\)\(\"\']+", "", candidate)
+    candidate = re.sub(r'[\)\(\"\']+', '', candidate)
+    
+    # Step 8: Final cleanup - remove remaining leading numbers not attached to %
+    # Pattern: if starts with just numbers (no %), strip them
+    m = re.match(r'^(\d+(?:[.,]\d+)?)\s*(?=[A-Za-z])', candidate)
+    if m:
+        # Check if this is NOT a percentage (no % immediately after)
+        after_num = candidate[m.end():]
+        if not after_num.startswith('%'):
+            candidate = candidate[m.end():]
+    
+    # Step 9: Clean up multiple spaces
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    
+    # Step 10: Final check - remove any position type substring that may remain
+    for pt in known_position_types:
+        candidate = re.sub(re.escape(pt), "", candidate, flags=re.IGNORECASE)
     candidate = re.sub(r"\s+", " ", candidate).strip()
 
     return candidate
