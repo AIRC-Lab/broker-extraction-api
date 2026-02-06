@@ -702,17 +702,42 @@ def get_client_name_from_text(text: Union[str, List[str]]):
 
 
 def get_foreign_unit_price(row_json, transaction_type):
-    if transaction_type == "Purchase":
-        parts = row_json.get("Cost/Purchase price", [""])
-        if parts and parts[0]:
-            foreign_unit_price = "".join(parts[0].strip().split(" ")[1:])
-        else:
-            foreign_unit_price = ""
-    else:
-        tp = row_json.get("Transaction price", [])
-        foreign_unit_price = tp[-1] if tp else ""
-    foreign_unit_price = re.sub(r"\s+", "", foreign_unit_price).strip()
-    return foreign_unit_price
+    # Corrected logic: Always take from 'Cost/Purchase price' column, first row
+    parts = row_json.get("Cost/Purchase price", [])
+    raw = ""
+    if parts and parts[0]:
+        raw = parts[0].strip()
+    
+    if not raw:
+        return ""
+
+    # Check for percentage
+    is_percentage = "%" in raw
+    
+    # Extract number pattern: optional sign, digits, commas, dots
+    # We want strict extraction.
+    match = re.search(r"[\-\+]?[\d, ]+(?:\.\d+)?", raw)
+    if not match:
+        return ""
+        
+    num_str = match.group(0)
+    
+    # Parse value
+    val = _parse_signed_number_string(num_str)
+    
+    if val == "":
+        return ""
+    
+    if is_percentage:
+        try:
+            val = val / 100
+        except Exception:
+            pass
+            
+    # Return as string, standardized (e.g. remove scientific notation if any, or just str)
+    # Using format to avoid scientific notation for small numbers if needed, but str() is usually fine for Decimal
+    # unless it's very small. `_parse_signed_number_string` returns Decimal.
+    return f"{val:f}" if isinstance(val, Decimal) else str(val)
 
 
 def get_foreign_gross_net_consideration(row_json, transaction_type):

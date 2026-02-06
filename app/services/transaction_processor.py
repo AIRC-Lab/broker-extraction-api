@@ -132,11 +132,16 @@ class TransactionProcessor:
                     ocr_box_of_current_row = [ocr_box[i] for i in row["index"]]
                     ocr_text_of_current_row = [ocr_text[i] for i in row["index"]]
 
+                    # Fix: Force strict center alignment for Cost/Purchase price to avoid Description overlap
+                    use_center_within = False
+                    if col_name == "Cost/Purchase price":
+                        use_center_within = True
+
                     aligned_indices = boxes_aligned_in_column_idx(
                         col_name_box,
                         ocr_box_of_current_row,
                         min_overlap_ratio=0.2,
-                        center_within=False,
+                        center_within=use_center_within,
                         below_header_only=True,   # tránh match nhầm header trên cùng hàng
                     )
                     row_json[col_name] = [ocr_text_of_current_row[i] for i in aligned_indices]
@@ -218,8 +223,113 @@ class TransactionProcessor:
                         if quantity is None or quantity == "" or quantity == 0:
                             quantity = extracted_qty
                     else:
-                        security_name = remove_start_number(security_name_raw)
+                        # Logic to handle "300 000 15 % Autocallable" vs "5.4% Autocallable"
+                        # Search for the first occurrence of a percentage pattern: digits + optional decimal + %
+                        match_pct = re.search(r"(\d+(?:[\.,]\d+)?\s*%)", security_name_raw)
+                        
+                        found_split = False
+                        if match_pct:
+                            pct_start = match_pct.start()
+                            if pct_start > 0:
+                                # Potential Quantity before Percentage
+                                prefix = security_name_raw[:pct_start].strip()
+                                # Check if prefix is purely a number (Quantity)
+                                # Allow digits, spaces, dots, commas, signs
+                                if re.fullmatch(r"[\-\+]?[\d\s\.,]+", prefix):
+                                    # It looks like a quantity number. Extract it.
+                                    if quantity is None or quantity == "" or quantity == 0:
+                                         try:
+                                             parsed_q = _parse_signed_number_string(prefix)
+                                             if parsed_q != "":
+                                                  quantity = str(parsed_q)
+                                         except:
+                                             pass
+                                    
+                                    # The name is the rest starting from percentage
+                                    security_name = security_name_raw[pct_start:].strip()
+                                    found_split = True
+                                else:
+                                    # Prefix is not just a number (e.g. "Bond 5.4%"). Keep it.
+                                    security_name = security_name_raw
+                                    found_split = True
+                            else:
+                                # Percentage is at the very start (e.g. "5.4% ...")
+                                security_name = security_name_raw
+                                found_split = True
+                        
+                        if not found_split:
+                            # No percentage pattern found, or fall through. Safe to use standard strip.
+                            security_name = remove_start_number(security_name_raw)
+
                         security_name = re.sub(r"\s+", " ", security_name).strip()
+
+                    # Additional Cleaning: Strip leading Currency and/or Number artifacts
+                    # Example: "HKD-668 085.6Accumulator..." -> "Accumulator..."
+                    def _recursive_clean_name(name):
+                        prev_name = None
+                        while name != prev_name:
+                            prev_name = name
+                            name = name.strip()
+                            
+                            # 1. Strip known currency prefix (e.g. "HKD", "USD")
+                            # Check start of string (3 chars)
+                            if len(name) >= 3:
+                                prefix = name[:3].upper()
+                                if prefix in currencies:
+                                    name = name[3:].strip()
+                                    # Also strip optional separator like "-" after currency
+                                    if name.startswith("-") or name.startswith("–"):
+                                         name = name[1:].strip()
+                                    continue
+
+                            # 2. Strip leading numbers/symbols (regex)
+                            # Be aggressive with numbers at start that are likely noise
+                            # Match: optional sign, digits, dots/commas/spaces, ending with non-word char or just end?
+                            # Actually, just strip strictly leading number-like chars.
+                            # BUT PROTECT PERCENTAGES HERE TOO
+                            # If it starts with number but is followed by %, don't strip it here.
+                            if re.match(r"^[\-\+]?[\d\s\.,]+%", name):
+                                break
+
+                            # Problem: "7-Eleven" vs "668 Accumulator". 
+                            # User case: "668 085.6Accumulator" (no space).
+                            # Regex: ^[\-\+]?[\d\s\.,]+
+                            match_num = re.match(r"^[\-\+]?[\d\s\.,]+", name)
+                            if match_num:
+                                # Only strip if it matches a substantial number logic or if followed by something?
+                                # If we strip "7", we might break names. 
+                                # But in this context (Broker statement), leading numbers are usually quantity artifacts.
+                                # Let's strip.
+                                removed_part = match_num.group(0)
+                                # Avoid stripping everything if it's just a space or comma
+                                if any(c.isdigit() for c in removed_part):
+                                    name = name[len(removed_part):].strip()
+                                    continue
+                        
+                        return name
+
+                    security_name = _recursive_clean_name(security_name)
+
+                    # Strip Date Patterns (e.g. "Perles ... 2025-05.06.2026")
+                    # Truncate at the first occurrence of a date pattern
+                    # Patterns: YYYY-MM.DD.YYYY, DD.MM.YYYY, etc.
+                    # Looking for a sequence of digits and dots/dashes that looks like a date range or date
+                    date_patterns = [
+                         r"\d{4}[-.]\d{2}[-.]\d{2}[-.]\d{4}", # 2025-05.06.2026
+                         r"\d{4}[-.]\d{2}[-.]\d{2}",         # 2025-05.06
+                         r"\d{2}[-.]\d{2}[-.]\d{4}",         # 05.06.2026
+                         r"\d{2}[-.]\d{2}[-.]\d{2}"          # 05.06.26 (risky?)
+                    ]
+                    # Specific broad regex for date suffix starting with 20\d\d
+                    match_date = re.search(r"\b20\d{2}[-.]\d{2}[-.]\d{2}", security_name)
+                    if match_date:
+                        security_name = security_name[:match_date.start()].strip()
+                    else:
+                        match_date_2 = re.search(r"\b\d{2}\.\d{2}\.\d{2,4}", security_name)
+                        if match_date_2:
+                             # Validation: is it really a date? 
+                             # Assume yes for now if it's at the end
+                             security_name = security_name[:match_date_2.start()].strip()
 
                     account_no = get_account_no(row_json)
                     foreign_unit_price = get_foreign_unit_price(row_json, transaction_type)
@@ -299,10 +409,56 @@ class TransactionProcessor:
                     
                     booking_text_val = row_json["Booking text"][0].strip() if row_json.get("Booking text") else ""
 
+                    # Extract Quantity EARLY (moved up for use in Description logic)
+                    qty_raw_list = row_json.get("Number/Amount", [])
+                    qty_raw = qty_raw_list[0].strip() if qty_raw_list else ""
+
+                    clean_qty = ""
+                    try:
+                        # Updated regex to allow spaces as thousands separators
+                        match_num = re.search(r"[\-\+]?[\d, ]+(?:\.\d+)?", qty_raw)
+                        if match_num:
+                            parsed_val = _parse_signed_number_string(match_num.group(0))
+                            if parsed_val != "":
+                                clean_qty = str(parsed_val)
+                    except Exception:
+                        clean_qty = ""
+
                     if transaction_type_out == "Increase":
-                        # For Increase: Description = content of Description column, Type = Short Type
-                        desc_val = row_json.get("Description", [])
-                        desc_str = desc_val[0].strip() if desc_val else ""
+                        # For Increase: Description = content after Currency and Number/Amount in the row
+                        # Strategy: find the right-most index of Currency or Quantity tokens in row["text"]
+                        # and take everything after it.
+                        row_tokens = row.get("text", [])
+                        max_idx = -1
+                        
+                        # 1. Locate Currency token
+                        if row_currency:
+                            for idx, t in enumerate(row_tokens):
+                                # Basic check: exact match or contained? 
+                                # Use exact match or startswith to be safe, assuming tokens are clean
+                                if t.strip() == row_currency:
+                                    max_idx = max(max_idx, idx)
+                        
+                        # 2. Locate Quantity tokens
+                        # We use the tokens assigned to "Number/Amount" column as reference
+                        if qty_raw_list:
+                            for q_token in qty_raw_list:
+                                q_clean = q_token.strip()
+                                for idx, t in enumerate(row_tokens):
+                                    if t.strip() == q_clean:
+                                        max_idx = max(max_idx, idx)
+
+                        desc_str = ""
+                        # If we found markers, take the suffix
+                        if max_idx != -1 and max_idx < len(row_tokens) - 1:
+                            desc_tokens = row_tokens[max_idx+1:]
+                            desc_str = " ".join(desc_tokens).strip()
+                        else:
+                            # Fallback: use column based if extraction failed to find markers
+                            # But apply a cleanup if it starts with currency/qty?
+                            desc_val = row_json.get("Description", [])
+                            desc_str = desc_val[0].strip() if desc_val else ""
+
                         row_excel["Description"] = desc_str
                         row_excel["Transaction type"] = transaction_type_out
                     else:
@@ -314,24 +470,6 @@ class TransactionProcessor:
                     row_excel["Trade date"] = trade_date
                     row_excel["Settlement date"] = settlement_date
                     row_excel["Currency"] = row_currency
-                    # Extract Quantity from "Number/Amount" and strip currency if present
-                    qty_raw_list = row_json.get("Number/Amount", [])
-                    qty_raw = qty_raw_list[0].strip() if qty_raw_list else ""
-
-                    # Strict extraction: find the first sequence that looks like a number
-                    try:
-                        # Updated regex to allow spaces as thousands separators
-                        # Matches: optional sign, digits/commas/spaces, optional decimal part
-                        match_num = re.search(r"[\-\+]?[\d, ]+(?:\.\d+)?", qty_raw)
-                        clean_qty = ""
-                        if match_num:
-                            # Parse the candidate string
-                            parsed_val = _parse_signed_number_string(match_num.group(0))
-                            if parsed_val != "":
-                                clean_qty = str(parsed_val)
-                    except Exception:
-                        clean_qty = ""
-
                     row_excel["Quantity"] = clean_qty
                     row_excel["Foreign Unit Price/ Interest rate"] = ""
 
